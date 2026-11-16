@@ -25,7 +25,7 @@ if (-not (Test-Path -LiteralPath $dll)) {
     & $compiler @common /LD (Join-Path $nativeRoot 'NativeHooks.cpp') ('/Fo' + (Join-Path $obj 'NativeHooks.obj')) @libraries ('/OUT:' + $dll) ('/IMPLIB:' + (Join-Path $obj 'NativeHooks.lib'))
     if ($LASTEXITCODE -ne 0) { throw 'Native hook compilation failed.' }
 }
-@('[Native]',('Dll=' + $dllName),'Version=0.3.0','Architecture=x64') | Set-Content -LiteralPath (Join-Path $out 'runtime.ini') -Encoding ASCII
+@('[Native]',('Dll=' + $dllName),'Version=0.3.7','Architecture=x64') | Set-Content -LiteralPath (Join-Path $out 'runtime.ini') -Encoding ASCII
 Write-Output ('PASS native hook build: ' + $dllName)
 if (-not $SkipTests) {
     foreach ($suite in @('NativeLifecycleTests','NativeRoutingTests','NativePaintTests','NativeTests')) {

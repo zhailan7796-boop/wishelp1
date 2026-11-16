@@ -68,6 +68,10 @@ int wmain(int argc,wchar_t** argv) {
         auto cancelCompatibility=reinterpret_cast<CancelCompatibilityFn>(GetProcAddress(module,"TF_CancelCompatibility"));
         auto enable=reinterpret_cast<EnableFn>(GetProcAddress(module,"TF_SetEnabled"));
         auto status=reinterpret_cast<StatusFn>(GetProcAddress(module,"TF_Status"));
+        auto shellLaunch=reinterpret_cast<BOOL(*)(HWND,HMONITOR)>(GetProcAddress(module,"TF_TestShellLaunch"));
+        auto intentBytes=reinterpret_cast<unsigned(*)()>(GetProcAddress(module,"TF_IntentBytes"));
+        auto takeover=reinterpret_cast<BOOL(*)(unsigned)>(GetProcAddress(module,"TF_BeginFallback"));
+        Check(intentBytes && intentBytes()==sizeof(NativeIntent),"controller can reject an incompatible intent ABI before startup");
         Check(start && stop && release && intent && cancel && cancelCompatibility && enable && status,"routing ABI is present");
         std::vector<HMONITOR> monitors; EnumDisplayMonitors(nullptr,nullptr,Collect,reinterpret_cast<LPARAM>(&monitors));
         Check(!monitors.empty(),"at least one monitor is available");
@@ -137,6 +141,28 @@ int wmain(int argc,wchar_t** argv) {
         Check(intent(Messages.serial,&snapshot,sizeof(snapshot)) && snapshot.entry.flags==entry.flags && !snapshot.nativeClaimed,
             "packaged launch exposes its exact flags and initially unclaimed state");
         Check(cancelCompatibility(Messages.serial)!=FALSE,"a packaged follow can end its own intent after confirmation");
+        entry.flags=TF_VERIFIED_FOLLOW; entry.count=1;
+        entry.windows[0]={reinterpret_cast<UINT_PTR>(statusWindow),GetCurrentProcessId(),0};
+        const unsigned beforeVerified=Messages.compat;
+        Check(release(&entry,target,FALSE)!=FALSE,"any verified existing window can request bounded backup");
+        Wait([&] {return Messages.compat==beforeVerified+1;});
+        Check(intent(Messages.serial,&snapshot,sizeof(snapshot)) && snapshot.entry.count==1
+            && snapshot.entry.windows[0].hwnd==reinterpret_cast<UINT_PTR>(statusWindow),"verified backup retains exact HWND/PID");
+        Check(takeover && takeover(Messages.serial),"backup atomically takes ownership of its matching serial");
+        Check(intent(Messages.serial,&snapshot,sizeof(snapshot)),"handoff preserves the live intent for target verification and input cancellation");
+        Check(!takeover(Messages.serial+1),"a different serial cannot take over this click");
+        cancel(0);
+        Check(!takeover(Messages.serial),"new input invalidates an uncompleted fallback takeover");
+        Check(shellLaunch!=nullptr,"shell launch test interface is available");
+        const unsigned beforeShell=Messages.compat;
+        Check(shellLaunch(statusWindow,target)!=FALSE,"explicit owned shell-launch path posts a bounded intent");
+        Wait([&] {return Messages.compat==beforeShell+1;});
+        Check(intent(Messages.serial,&snapshot,sizeof(snapshot)) && snapshot.entry.flags==TF_SHELL_LAUNCH
+            && snapshot.entry.count==0 && !snapshot.entry.path[0] && !snapshot.entry.appId[0],"shell origin does not invent a target application identity");
+        Check(snapshot.before==reinterpret_cast<UINT_PTR>(statusWindow) && snapshot.source==snapshot.before
+            && snapshot.expires-snapshot.released==2000,"shell launch preserves origin HWND and its two-second expiry");
+        cancel(0); Check(!intent(Messages.serial,&snapshot,sizeof(snapshot)),"another input cancels shell-origin routing");
+        Check(!shellLaunch(nullptr,target),"a missing/unowned shell source cannot be armed in test mode");
         entry.count=0; entry.flags=0;
         Check(!release(&entry,target,FALSE),"unverified no-window button remains unsupported");
         wcscpy_s(entry.path,L"C:\\not-the-test-executable.exe"); entry.flags=TF_COLD_START|TF_COMPATIBILITY;

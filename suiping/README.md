@@ -1,11 +1,11 @@
 <h1 align="center">随屏</h1>
 <p align="center"><strong>副屏点开的应用，在副屏接着用。</strong></p>
 <p align="center">
-  <a href="https://github.com/zhailan7796-boop/wishelp1/releases/download/suiping-v0.3.6/TaskbarFollow-0.3.6-portable.zip"><strong>下载 Windows 便携版 ↓</strong></a>
+  <a href="https://github.com/zhailan7796-boop/wishelp1/releases/download/suiping-v0.3.7/TaskbarFollow-0.3.7-portable.zip"><strong>下载 Windows 便携版 ↓</strong></a>
   ·
-  <a href="https://github.com/zhailan7796-boop/wishelp1/releases/tag/suiping-v0.3.6">查看版本</a>
+  <a href="https://github.com/zhailan7796-boop/wishelp1/releases/tag/suiping-v0.3.7">查看版本</a>
 </p>
-<p align="center">Windows 11 x64 · v0.3.6 · 解压即用</p>
+<p align="center">Windows 11 x64 · v0.3.7 · 解压即用</p>
 
 ## 少一次把窗口拖回来的动作
 
@@ -14,6 +14,14 @@
 - **先看一眼再打开。** 悬停在任务栏的窗口缩略图上，可以在当前屏幕预览，原窗口留在原位。
 - **想暂停就暂停。** 按 `Ctrl+Alt+F12` 切换跟随状态，也可以从托盘打开状态窗口操作。
 - **接上副屏再启动。** 可在托盘菜单开启「连接第二块屏幕时自动启动」。
+
+## 0.3.7 更新
+
+已打开窗口的跨屏恢复统一处理，原来的 Chrome 专用修复扩展为通用恢复流程；补齐已核验应用包和系统托管窗口的定位检查。
+
+桌面、资源管理器和菜单点击打开的独立窗口，也会尝试跟随点击屏幕。悬停预览会核对当前窗口，避免显示上一应用的画面。
+
+17 组脚本检查和 4 组原生回归通过，覆盖跨屏恢复、原状态保留、实际绘制和取消操作。具体应用仍受窗口身份、权限和启动方式影响，详见[验证记录](docs/TEST-REPORT.md)。
 
 ## 三步开始
 

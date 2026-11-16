@@ -8,7 +8,9 @@ constexpr unsigned TF_COLD_START = 1;
 constexpr unsigned TF_REQUIRE_APP_ID = 2;
 constexpr unsigned TF_COMPATIBILITY = 4; // explicit-click, after-show routing for x86 applications
 constexpr unsigned TF_PACKAGED_FOLLOW = 8; // after-show backup for a packaged launch without a cached window
-constexpr unsigned TF_AFTER_SHOW = TF_COMPATIBILITY | TF_PACKAGED_FOLLOW;
+constexpr unsigned TF_VERIFIED_FOLLOW = 16; // bounded backup for any verified taskbar identity
+constexpr unsigned TF_SHELL_LAUNCH = 32; // new foreground window from an explicit shell/menu click
+constexpr unsigned TF_AFTER_SHOW = TF_COMPATIBILITY | TF_PACKAGED_FOLLOW | TF_VERIFIED_FOLLOW | TF_SHELL_LAUNCH;
 constexpr unsigned TF_TEST_MODE = 1;
 struct NativeCandidate { std::uint64_t hwnd; std::uint32_t pid, reserved; };
 struct alignas(8) NativeEntry {
@@ -31,8 +33,9 @@ struct alignas(8) NativeIntent {
     NativeEntry entry;
     std::uint64_t monitor, released, expires;
     std::uint32_t serial, nativeClaimed;
+    std::uint64_t before, source;
 };
-static_assert(sizeof(NativeIntent) == 3136, "AHK compatibility intent ABI");
+static_assert(sizeof(NativeIntent) == 3152, "AHK compatibility intent ABI");
 enum NativeEvent : unsigned { TF_ARMED=1, TF_CREATE=2, TF_RESTORE=3, TF_ACTIVATE=4,
     TF_FIRST_SHOW=5, TF_CANCEL=6, TF_GROUP=7, TF_UNSUPPORTED=8, TF_SAME_SCREEN=9, TF_EXPIRED=10,
     TF_PEEK_SHOW=12, TF_PEEK_HIDE=13, TF_POSITION_REJECTED=16 };
@@ -53,6 +56,10 @@ TF_API void TF_Cancel(unsigned cooldownMs);
 TF_API BOOL TF_PublishCache(const NativeEntry* entries, unsigned count, unsigned stride);
 TF_API BOOL TF_Status(NativeStatus* status, unsigned bytes);
 TF_API BOOL TF_CompatibilityIntent(unsigned serial, NativeIntent* intent, unsigned bytes);
+TF_API unsigned TF_IntentBytes();
+// Atomically hands this exact transaction to the after-show controller. Its
+// native subclasses/hooks must stop positioning without cancelling the intent.
+TF_API BOOL TF_BeginFallback(unsigned serial);
 // A stale compatibility callback cannot cancel a newer click transaction.
 TF_API BOOL TF_CancelCompatibility(unsigned serial);
 // Test mode installs no input hooks and can arm only the test executable's path.
@@ -70,3 +77,4 @@ TF_API BOOL TF_TestLifecycle(HANDLE startupGate, HANDLE shutdownGate,
     HANDLE startupEntered, HANDLE shutdownEntered, DWORD startupError);
 TF_API BOOL TF_TestSetUnhookFailure(BOOL enabled);
 TF_API BOOL TF_TestReleaseEntry(const NativeEntry* entry, HMONITOR target, BOOL preview);
+TF_API BOOL TF_TestShellLaunch(HWND source, HMONITOR target);

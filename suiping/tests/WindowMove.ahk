@@ -54,6 +54,20 @@ try {
     Log("max-after=" . Desktop.MonitorOf(g.Hwnd).Device . " max-state=" . NumGet(Desktop.Placement(g.Hwnd), 8, "uint"))
     if !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd), one) || NumGet(Desktop.Placement(g.Hwnd), 8, "uint") != 3
         throw Error("Maximized move failed")
+    if WindowMover.Move(g.Hwnd,two,false,true) != "requested"
+        throw Error("Visible maximized refresh was not requested")
+    Sleep(350)
+    if Desktop.IsMin(g.Hwnd) || !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd),two) || NumGet(Desktop.Placement(g.Hwnd),8,"uint") != 3
+        throw Error("Visible refresh did not preserve maximized state on target")
+    DllCall("user32\ShowWindow","ptr",g.Hwnd,"int",9)
+    Sleep(100)
+    if WindowMover.Move(g.Hwnd,one,false,true) != "requested"
+        throw Error("Visible normal refresh was not requested")
+    Sleep(350)
+    if Desktop.IsMin(g.Hwnd) || !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd),one) || NumGet(Desktop.Placement(g.Hwnd),8,"uint") = 3
+        throw Error("Visible refresh did not preserve normal state on target")
+    DllCall("user32\ShowWindow","ptr",g.Hwnd,"int",3)
+    Sleep(100)
     DllCall("user32\ShowWindow", "ptr", g.Hwnd, "int", 6)
     Sleep(100)
     if !Desktop.IsMin(g.Hwnd) || WindowMover.Move(g.Hwnd, two, false) != "minimized"

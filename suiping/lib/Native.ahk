@@ -624,7 +624,7 @@ class NativeIdentityIndex {
 }
 
 class WindowMover {
-    static Move(hwnd, destination, restoreMinimized := false) {
+    static Move(hwnd, destination, restoreMinimized := false, refreshVisible := false) {
         Desktop.Physical()
         source := Desktop.MonitorOf(hwnd)
         target := Desktop.Monitor(destination.Handle)
@@ -646,6 +646,22 @@ class WindowMover {
         if !IsObject(normal)
             return "rect-failed"
         next := Geometry.Map(normal, source.Work, target.Work)
+        if refreshVisible && !wasMin && DllCall("user32\IsWindowVisible","ptr",hwnd) {
+            ; Queue both operations to the same owning UI thread. A visible
+            ; surface is retired before it is recreated on another display;
+            ; no guessed repaint messages or renderer/application lists.
+            minimized := Buffer(p.Size)
+            DllCall("ntdll\RtlMoveMemory","ptr",minimized,"ptr",p,"uptr",p.Size)
+            NumPut("uint",4,minimized,4)
+            NumPut("uint",7,minimized,8) ; SW_SHOWMINNOACTIVE
+            if !DllCall("user32\SetWindowPlacement","ptr",hwnd,"ptr",minimized)
+                return "minimize-placement-failed:" A_LastError
+            Geometry.ToWorkspace(next,target).Write(p,28)
+            NumPut("uint",4,p,4)
+            NumPut("uint",wasMax ? 3 : 9,p,8)
+            NumPut("int",-1,"int",-1,p,20)
+            return DllCall("user32\SetWindowPlacement","ptr",hwnd,"ptr",p) ? "requested" : "set-placement-failed:" A_LastError
+        }
         ; SetWindowPlacement keeps normal/maximized state and its own coordinate system.
         Geometry.ToWorkspace(next, target).Write(p, 28)
         NumPut("uint", 4, p, 4) ; WPF_ASYNCWINDOWPLACEMENT: do not block on a foreign UI thread

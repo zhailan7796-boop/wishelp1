@@ -1,9 +1,9 @@
 ; Native hooks own input capture and before-show positioning for 64-bit apps.
-; After-show checks are bounded to a verified 32-bit click or packaged launch.
+; Every verified taskbar click also has a bounded, identity-checked backup.
 class NativeEngine {
-    static PackagedFollowFlag := 8, AfterShowFlags := 4 | 8
+    static PackagedFollowFlag := 8, VerifiedFollowFlag := 16, ShellLaunchFlag := 32, AfterShowFlags := 4 | 8 | 16 | 32
     static Exports() => ["Start", "StopAndWait", "Configure", "SetEnabled", "Cancel", "PublishCache", "Status",
-        "SetPeekEnabled", "ShowPeek", "HidePeek", "HoverCandidates", "AccessibleName", "CompatibilityIntent", "CancelCompatibility"]
+        "SetPeekEnabled", "ShowPeek", "HidePeek", "HoverCandidates", "AccessibleName", "CompatibilityIntent", "CancelCompatibility", "IntentBytes", "BeginFallback"]
     static DllPath() {
         dllName := IniRead(A_ScriptDir . "\native\bin\runtime.ini", "Native", "Dll")
         if !RegExMatch(dllName, "^NativeHooks-[a-f0-9]+-x64\.dll$")
@@ -19,6 +19,9 @@ class NativeEngine {
                 if !DllCall("kernel32\GetProcAddress", "ptr", module, "astr", "TF_" . name, "ptr")
                     throw Error("原生定位组件版本不匹配。")
             }
+            bytesFn := DllCall("kernel32\GetProcAddress","ptr",module,"astr","TF_IntentBytes","ptr")
+            if DllCall(bytesFn,"uint") != 3152
+                throw Error("原生定位组件版本不匹配。")
         } finally DllCall("kernel32\FreeLibrary", "ptr", module)
     }
     __New(owner,path := "") {
@@ -63,6 +66,8 @@ class NativeEngine {
                 throw Error("原生定位组件版本不匹配。")
             this.DefineProp(name . "Fn", {Value: address})
         }
+        if DllCall(this.IntentBytesFn,"uint") != 3152
+            throw Error("原生定位组件版本不匹配。")
     }
     SetEnabled(enabled) {
         if !enabled
@@ -82,26 +87,19 @@ class NativeEngine {
             x := Integer(fields[1]), y := Integer(fields[2]), popup := Integer(fields[3])
             list := Buffer(32*16,0)
             count := DllCall(this.HoverCandidatesFn,"ptr",list,"uint",32,"uint")
-            accessibleName := ""
-            if count > 1 {
-                nameBuffer := Buffer(2048,0)
-                if DllCall(this.AccessibleNameFn,"int",x,"int",y,"ptr",nameBuffer,"uint",1024,"int")
-                    accessibleName := TaskbarUIAField(StrGet(nameBuffer))
-            }
-            matches := []
+            names := [], candidates := []
+            nameBuffer := Buffer(2048,0)
+            if DllCall(this.AccessibleNameFn,"int",x,"int",y,"ptr",nameBuffer,"uint",1024,"int")
+                names.Push(TaskbarUIAField(StrGet(nameBuffer)))
+            Loop fields.Length-3
+                names.Push(fields[A_Index+3])
             Loop count {
                 hwnd := NumGet(list,(A_Index-1)*16,"uint64"), pid := NumGet(list,(A_Index-1)*16+8,"uint")
                 if Desktop.Pid(hwnd) != pid
                     continue
-                title := TaskbarUIAField(Desktop.Title(hwnd))
-                found := count = 1 || (title != "" && accessibleName == title)
-                Loop fields.Length-3 {
-                    if fields[A_Index+3] == title && title != ""
-                        found := true
-                }
-                if found
-                    matches.Push({Hwnd:hwnd,Pid:pid})
+                candidates.Push({Hwnd:hwnd,Pid:pid,Title:TaskbarUIAField(Desktop.Title(hwnd))})
             }
+            matches := NativeEngine.HoverMatches(candidates,names)
             state := count . ":" . matches.Length . ":" . popup
             if state != this.HoverState {
                 this.HoverState := state
@@ -116,12 +114,28 @@ class NativeEngine {
             DllCall(this.HidePeekFn)
         }
     }
+    static HoverMatches(candidates,names) {
+        matches := [], seen := Map()
+        for candidate in candidates {
+            if candidate.Title = "" || seen.Has(candidate.Hwnd)
+                continue
+            for name in names {
+                if name != "" && name == candidate.Title {
+                    seen[candidate.Hwnd] := true
+                    matches.Push(candidate)
+                    break
+                }
+            }
+        }
+        return matches
+    }
     Cancel(cooldown := 0) {
         this.StopCompatibility()
         return this.CancelNativeIntent(cooldown)
     }
     CancelNativeIntent(cooldown := 0) => DllCall(this.CancelFn, "uint", cooldown)
     CancelCompatibilityIntent(serial) => DllCall(this.CancelCompatibilityFn,"uint",serial,"int")
+    CompatibilityTakeover(serial) => DllCall(this.BeginFallbackFn,"uint",serial,"int")
     BeginCompatibility(serial,monitorHandle) {
         if !this.Handle || !this.Owner.Enabled
             return false
@@ -145,17 +159,18 @@ class NativeEngine {
                 return true
             this.StopCompatibility()
             packaged := !!(fresh.Flags & NativeEngine.PackagedFollowFlag)
-            label := packaged ? "应用包窗口补充定位" : "32位兼容定位"
+            shell := !!(fresh.Flags & NativeEngine.ShellLaunchFlag), verified := !!(fresh.Flags & NativeEngine.VerifiedFollowFlag)
+            label := shell ? "打开窗口随屏" : (verified ? "窗口补充定位" : (packaged ? "应用包窗口补充定位" : "32位兼容定位"))
             this.Compatibility := {Serial:serial,Target:target,Expires:fresh.Expires,Hwnd:0,Pid:0,Since:0,
-                Requested:false,RequestedAt:0,Label:label,
-                LogLabel:packaged ? "packaged follow" : "32-bit compatibility"}
+                Requested:false,RequestedAt:0,Recovering:false,Label:label,
+                LogLabel:shell ? "shell launch" : (verified ? "verified follow" : (packaged ? "packaged follow" : "32-bit compatibility"))}
             this.CompatibilitySchedule(true)
         } finally Critical(previousCritical ? previousCritical : "Off")
         this.Owner.ReportActivity(label . "正在等待所选窗口显示。")
         return true
     }
     ReadCompatibilityIntent(serial) {
-        snapshot := Buffer(3136,0)
+        snapshot := Buffer(3152,0)
         if !DllCall(this.CompatibilityIntentFn,"uint",serial,"ptr",snapshot,"uint",snapshot.Size,"int")
             return 0
         count := NumGet(snapshot,28,"uint"), candidates := []
@@ -167,38 +182,70 @@ class NativeEngine {
         return {Id:StrGet(snapshot.Ptr+32,256),Path:StrGet(snapshot.Ptr+544,1024),
             Flags:NumGet(snapshot,24,"uint"),Candidates:candidates,Monitor:NumGet(snapshot,3104,"uint64"),
             Released:NumGet(snapshot,3112,"uint64"),Expires:NumGet(snapshot,3120,"uint64"),
-            Serial:NumGet(snapshot,3128,"uint"),NativeClaimed:NumGet(snapshot,3132,"uint")}
+            Serial:NumGet(snapshot,3128,"uint"),NativeClaimed:NumGet(snapshot,3132,"uint"),
+            Before:NumGet(snapshot,3136,"uint64"),Source:NumGet(snapshot,3144,"uint64")}
     }
     CompatibilityNow() => Desktop.Tick()
     CompatibilityMonitor(handle) => Desktop.Monitor(handle)
     CompatibilitySchedule(enabled) => SetTimer(this.CompatibilityTimer,enabled ? 50 : 0)
-    CompatibilityForeground() {
-        hwnd := Desktop.Foreground()
+    CompatibilitySnapshot(hwnd) {
         if !hwnd
             return 0
         return {Hwnd:hwnd,Data:this.Owner.Identity.Get(hwnd),Eligible:Desktop.Eligible(hwnd),
             Visible:DllCall("user32\IsWindowVisible","ptr",hwnd),Minimized:Desktop.IsMin(hwnd),
             Monitor:Desktop.MonitorOf(hwnd)}
     }
-    CompatibilityMove(hwnd,target) => Desktop.Foreground() = hwnd && Desktop.Pid(hwnd) = this.Compatibility.Pid
-        ? WindowMover.Move(hwnd,target) : "focus-changed"
-    static CompatibilityDelay(intent) => (intent.Flags & NativeEngine.PackagedFollowFlag) && intent.NativeClaimed ? 500 : 80
+    CompatibilityForeground() => this.CompatibilitySnapshot(Desktop.Foreground())
+    CompatibilityRescue(intent) {
+        ; With no usable in-process hook, Explorer may minimize an application
+        ; that was already active on the other screen. Rescue only that exact
+        ; pre-click HWND/PID, never an arbitrary minimized group member.
+        if !(intent.Flags & NativeEngine.VerifiedFollowFlag) || !intent.Before || intent.Candidates.Length != 1
+            || intent.Candidates[1].Hwnd != intent.Before || !this.Owner.BringActive
+            || this.CompatibilityNow()-intent.Released > 1200
+            return 0
+        window := this.CompatibilitySnapshot(intent.Before)
+        if !IsObject(window) || !window.Minimized || window.Data.Pid != intent.Candidates[1].Pid
+            || Desktop.SameMonitor(window.Monitor,this.Compatibility.Target)
+            return 0
+        window.Recovery := true
+        return window
+    }
+    CompatibilityMove(hwnd,target) => (Desktop.Foreground() = hwnd || this.Compatibility.Recovering)
+        && Desktop.Pid(hwnd) = this.Compatibility.Pid
+        ? WindowMover.Move(hwnd,target,this.Compatibility.Recovering,true) : "focus-changed"
+    static CompatibilityDelay(intent) => (intent.Flags & (NativeEngine.PackagedFollowFlag | NativeEngine.VerifiedFollowFlag)) && intent.NativeClaimed ? 500 : 80
     CompatibilityMatches(intent,window) {
-        if !IsObject(window) || !window.Hwnd || !window.Data.Pid || !window.Visible || window.Minimized || !window.Eligible
+        if !IsObject(window) || !window.Hwnd || !window.Data.Pid || !window.Visible || !window.Eligible
             return false
+        if window.Minimized && !(window.HasOwnProp("Recovery") && window.Recovery
+            && (intent.Flags & NativeEngine.VerifiedFollowFlag) && window.Hwnd = intent.Before)
+            return false
+        if intent.Flags & NativeEngine.ShellLaunchFlag
+            return window.Hwnd != intent.Before && window.Hwnd != intent.Source
+        if intent.Candidates.Length {
+            for candidate in intent.Candidates {
+                if candidate.Hwnd != window.Hwnd || candidate.Pid != window.Data.Pid
+                    continue
+                if intent.Path != "" && window.Data.Path != "" && StrLower(intent.Path) != StrLower(window.Data.Path)
+                    return false
+                ; A verified HWND/PID can belong to a protected/shared frame
+                ; whose executable cannot be queried. Recheck its exact AppID
+                ; instead of discarding all such application windows.
+                if window.Data.AppId != ""
+                    return this.Owner.Identity.Match(intent.Id,window.Data)
+                return intent.Path != "" && window.Data.Path != "" && StrLower(intent.Path) = StrLower(window.Data.Path)
+                    && !(intent.Flags & 2) && this.Owner.Identity.Match(intent.Id,window.Data)
+            }
+            return false
+        }
         if intent.Path = "" || window.Data.Path = "" || StrLower(intent.Path) != StrLower(window.Data.Path)
             return false
         if (intent.Flags & 2) && !(window.Data.AppId != "" && window.Data.AppId == intent.Id)
             return false
         if !this.Owner.Identity.Match(intent.Id,window.Data)
             return false
-        if !intent.Candidates.Length
-            return !!(intent.Flags & 1)
-        for candidate in intent.Candidates {
-            if candidate.Hwnd = window.Hwnd && candidate.Pid = window.Data.Pid
-                return true
-        }
-        return false
+        return !!(intent.Flags & 1)
     }
     CompatibilityCurrent(state) => IsObject(this.Compatibility) && this.Compatibility = state && this.Handle && this.Owner.Enabled
     StopCompatibility(expected := 0) {
@@ -264,6 +311,12 @@ class NativeEngine {
             }
             window := this.CompatibilityForeground()
             if !this.CompatibilityMatches(intent,window) {
+                if state.Requested && state.Recovering
+                    window := this.CompatibilitySnapshot(state.Hwnd)
+                else if !state.Requested
+                    window := this.CompatibilityRescue(intent)
+            }
+            if !this.CompatibilityMatches(intent,window) {
                 if state.Requested
                     this.EndCompatibility(state,state.Label . "已结束，所选窗口已隐藏、最小化或切换焦点。")
                 else
@@ -283,6 +336,7 @@ class NativeEngine {
             }
             if state.Hwnd != window.Hwnd || state.Pid != window.Data.Pid {
                 state.Hwnd := window.Hwnd, state.Pid := window.Data.Pid, state.Since := now
+                state.Recovering := window.HasOwnProp("Recovery") && window.Recovery
                 return
             }
             if now-state.Since < NativeEngine.CompatibilityDelay(intent)
@@ -293,7 +347,7 @@ class NativeEngine {
             }
             ; Window identity queries can dispatch messages. Finish those before
             ; entering the short, final state/epoch check and move request.
-            selected := this.CompatibilityForeground()
+            selected := state.Recovering ? this.CompatibilityRescue(intent) : this.CompatibilityForeground()
             if !this.CompatibilityMatches(intent,selected) || selected.Hwnd != state.Hwnd || selected.Data.Pid != state.Pid {
                 state.Hwnd := 0, state.Pid := 0, state.Since := 0
                 return
@@ -314,6 +368,8 @@ class NativeEngine {
                     return
                 }
                 if now-state.Since < NativeEngine.CompatibilityDelay(fresh) || !this.CompatibilityMatches(fresh,selected)
+                    return
+                if !this.CompatibilityTakeover(fresh.Serial)
                     return
                 result := this.CompatibilityMove(state.Hwnd,state.Target)
                 if result = "requested"
@@ -480,10 +536,12 @@ class NativeEngine {
         binaryType := cold ? index.BinaryType(path) : -1
         compatibility := binaryType = 0
         packagedFollow := binaryType = 6 && !candidates.Length && WindowIdentity.PackageId(id)
+        verifiedFollow := !compatibility && !packagedFollow && (binaryType = 6 || candidates.Length)
         ; Retain unsupported buttons too: an explicit click should report why it
         ; was skipped, not vanish from the cache without any status/log feedback.
         return {Id:id,Path:path,Candidates:candidates,
-            Flags:(cold?1:0)|(requireId?2:0)|(compatibility?4:0)|(packagedFollow?NativeEngine.PackagedFollowFlag:0)}
+            Flags:(cold?1:0)|(requireId?2:0)|(compatibility?4:0)|(packagedFollow?NativeEngine.PackagedFollowFlag:0)
+                |(verifiedFollow?NativeEngine.VerifiedFollowFlag:0)}
     }
     Poll() {
         status := Buffer(168,0)

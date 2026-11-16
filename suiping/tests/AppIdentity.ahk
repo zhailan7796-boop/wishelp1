@@ -35,7 +35,7 @@ try {
     cold := NativeEngine.ResolveEntry(id, [], ids)
     AppIdentityChecks.Equal(cold.Path, systemPath, "Cold Explorer button retains the verified system path")
     AppIdentityChecks.Equal(cold.Candidates.Length, 0, "Cold Explorer resolution does not invent a window")
-    AppIdentityChecks.Equal(cold.Flags, 1, "Cold Explorer is eligible without requiring an absent explicit AppID")
+    AppIdentityChecks.Equal(cold.Flags, 17, "Cold Explorer has native positioning and an identity-checked backup")
 
     matching := AppIdentityChecks.Window(1, "", systemPath)
     otherInstallation := AppIdentityChecks.Window(2, "", A_Temp . "\Other\explorer.exe")
@@ -70,7 +70,7 @@ try {
     architecture.BinaryType(StrUpper(x86Path))
     AppIdentityChecks.Equal(architecture.BinaryTypes.Count, 2, "Binary type queries share a case-insensitive path cache per publish")
     AppIdentityChecks.Equal(NativeEngine.ResolveEntry(x86Path, [], ids).Flags, 5, "A verified 32-bit path opts into compatibility")
-    AppIdentityChecks.Equal(NativeEngine.ResolveEntry(x64Path, [], ids).Flags, 1, "A verified 64-bit path retains native cold positioning")
+    AppIdentityChecks.Equal(NativeEngine.ResolveEntry(x64Path, [], ids).Flags, 17, "A verified 64-bit path has native positioning and bounded backup")
     FileAppend("Inert executable-existence fixture; never executed", nonImage, "UTF-8")
     AppIdentityChecks.Equal(architecture.BinaryType(nonImage . ".missing"), -1, "A failed binary query remains an unknown architecture")
     AppIdentityChecks.Assert(architecture.BinaryType(nonImage) != 0, "An inert text fixture is not classified as a 32-bit Windows image")
@@ -96,7 +96,7 @@ try {
     packaged := NativeEngine.ResolveEntry(packagedId, [], ids)
     AppIdentityChecks.Equal(packaged.Flags,11,"A packaged cold launch has an exact-ID native route and bounded after-show fallback")
     warmPackage := NativeEngine.ResolveEntry(packagedId,[AppIdentityChecks.Window(6,packagedId,packageImage)],ids)
-    AppIdentityChecks.Equal(warmPackage.Flags,3,"A known packaged window stays on the existing native route")
+    AppIdentityChecks.Equal(warmPackage.Flags,19,"A known packaged window also has bounded backup")
     AppIdentityChecks.Assert(!ids.Match(packagedId,{AppId:"TaskbarFollow.IdentityFixture_0000000000000!Secondary",
         Path:packageImage,Exe:"Fixture.exe"}),"A different entry sharing a package image cannot match")
 

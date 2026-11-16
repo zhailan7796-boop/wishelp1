@@ -127,17 +127,17 @@ try {
     Spec.Equal(coldEntry.Candidates.Length,0,"Cold start does not invent a window candidate")
     Spec.Equal(coldEntry.Path,A_AhkPath,"Cold start retains the verified full executable path")
 
-    Spec.Equal(coldEntry.Flags,1,"Unique executable path does not require a window AppID")
+    Spec.Equal(coldEntry.Flags,17,"Unique executable path has native positioning and bounded backup")
     launchIds.Mappings["Local.OtherProfile"] := A_AhkPath
     sharedEntry := NativeEngine.ResolveEntry("com.ccswitch.desktop",[],launchIds)
-    Spec.Equal(sharedEntry.Flags,3,"Shared executable requires exact native window/process AppID")
+    Spec.Equal(sharedEntry.Flags,19,"Shared executable requires exact native window/process AppID and has backup")
     launchIds.Mappings.Delete("Local.OtherProfile")
     launchIds.NativePaths["com.CCSwitch.desktop"] := A_AhkPath
-    Spec.Equal(NativeEngine.ResolveEntry("com.ccswitch.desktop",[],launchIds).Flags,3,"Case-distinct opaque AppIDs sharing a path still require exact identity")
+    Spec.Equal(NativeEngine.ResolveEntry("com.ccswitch.desktop",[],launchIds).Flags,19,"Case-distinct opaque AppIDs sharing a path still require exact identity")
     launchIds.NativePaths.Delete("com.CCSwitch.desktop")
     launchIds.Pwas["Local.Pwa"] := {Host:A_AhkPath,App:"fixture",Profile:"Default"}
-    Spec.Equal(NativeEngine.ResolveEntry("com.ccswitch.desktop",[],launchIds).Flags,3,"A PWA sharing the host prevents executable-only cold matching")
-    Spec.Equal(NativeEngine.ResolveEntry("Local.Pwa",[],launchIds).Flags,3,"PWA retains exact AppID requirement")
+    Spec.Equal(NativeEngine.ResolveEntry("com.ccswitch.desktop",[],launchIds).Flags,19,"A PWA sharing the host prevents executable-only cold matching")
+    Spec.Equal(NativeEngine.ResolveEntry("Local.Pwa",[],launchIds).Flags,19,"PWA retains exact AppID requirement")
     launchIds.Pwas.Clear()
     noIdentity := NativeEngine.ResolveEntry("Local.Unknown",[],launchIds)
     Spec.Assert(IsObject(noIdentity) && noIdentity.Flags = 0 && noIdentity.Candidates.Length = 0,"Unsupported button remains cached for explicit status feedback")
@@ -153,7 +153,7 @@ try {
     Spec.Equal(NativeEngine.ResolveEntry("com.ccswitch.desktop",[wrongWindow],launchIds).Candidates.Length,0,"Explicit mismatching AppID cannot borrow a matching executable")
     secondPath := {Hwnd:125,Data:{Pid:458,AppId:"com.ccswitch.desktop",Path:"D:\Other\AutoHotkey64.exe",Exe:"AutoHotkey64.exe"}}
     ambiguousEntry := NativeEngine.ResolveEntry("com.ccswitch.desktop",[warmWindow,secondPath],launchIds)
-    Spec.Assert(ambiguousEntry.Candidates.Length = 2 && ambiguousEntry.Path = "" && ambiguousEntry.Flags = 0,"Conflicting verified paths retain HWND candidates but do not guess a cold executable")
+    Spec.Assert(ambiguousEntry.Candidates.Length = 2 && ambiguousEntry.Path = "" && ambiguousEntry.Flags = 16,"Conflicting verified paths retain HWND candidates and backup but do not guess a cold executable")
 
     ; Verify the controller discards stale IPC responses, and cannot cancel a newer transaction.
     app := TaskbarFollow(true)

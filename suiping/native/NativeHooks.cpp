@@ -17,14 +17,14 @@ constexpr std::uint64_t PlacementSettleMs = 250;
 struct Transaction {
     NativeEntry entry;
     MONITORINFOEXW target;
-    std::uint64_t monitor, before, released, expires;
+    std::uint64_t monitor, before, released, expires, source;
     unsigned serial, preview, epoch;
 };
 struct alignas(8) Shared {
     DWORD magic, ownerPid;
     volatile LONG running, enabled, cacheIndex, cacheSequence, timeoutMs, bringActive;
     volatile LONG txSequence, serial, inputEpoch;
-    volatile LONG64 heartbeat, cacheAt, coolUntil, claim;
+    volatile LONG64 heartbeat, cacheAt, coolUntil, claim, fallback;
     volatile LONG64 armed, created, restored, activated, firstShown, cancelled, eventNumber;
     volatile LONG lastKind, lastPid;
     volatile LONG64 lastWindow, latency;
@@ -161,6 +161,10 @@ bool Candidate(const Transaction& tx, HWND hwnd) {
         if (tx.entry.windows[i].hwnd==Id(hwnd) && tx.entry.windows[i].pid==pid) return true;
     return false;
 }
+bool FallbackOwns(Shared* shared,const Transaction& tx) {
+    const auto owned=(static_cast<std::uint64_t>(tx.serial)<<32)|1u;
+    return static_cast<std::uint64_t>(Read64(shared->fallback))==owned;
+}
 bool Claim(Shared* shared,const Transaction& tx, HWND hwnd) {
     const LONG64 empty=static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32);
     const LONG64 desired=empty | static_cast<unsigned>(reinterpret_cast<UINT_PTR>(hwnd));
@@ -176,8 +180,10 @@ bool Eligible(HWND hwnd, bool creation=false, const CREATESTRUCTW* cs=nullptr) {
     const LONG_PTR style=creation ? cs->style : GetWindowLongPtrW(hwnd,GWL_STYLE);
     const LONG_PTR ex=creation ? cs->dwExStyle : GetWindowLongPtrW(hwnd,GWL_EXSTYLE);
     if (style&WS_CHILD || ex&(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE)) return false;
-    if (!(style&WS_CAPTION)) return false;
-    if (creation ? cs->hwndParent!=nullptr : GetWindow(hwnd,GW_OWNER)!=nullptr) return false;
+    // Custom title bars do not necessarily have WS_CAPTION. Use top-level
+    // application styles, consistent with the controller's candidate filter.
+    if (!(style&(WS_CAPTION|WS_SYSMENU|WS_THICKFRAME)) && !(ex&WS_EX_APPWINDOW)) return false;
+    if ((creation ? cs->hwndParent!=nullptr : GetWindow(hwnd,GW_OWNER)!=nullptr) && !(ex&WS_EX_APPWINDOW)) return false;
     return true;
 }
 RECT MapRect(RECT rect,const RECT& source,const RECT& target) {
@@ -239,7 +245,7 @@ struct PlacementCall {
 };
 bool StillCurrent(Shared* shared,const Transaction& tx) {
     Transaction current;
-    return Snapshot(shared,current) && current.serial==tx.serial;
+    return Snapshot(shared,current) && current.serial==tx.serial && !FallbackOwns(shared,tx);
 }
 void RemovePlacement(HWND hwnd,Placement* placement);
 RECT NormalOnTarget(HWND hwnd,const Transaction& tx,const WINDOWPLACEMENT& wp);
@@ -270,13 +276,14 @@ BOOL ApplyVisibleRect(HWND hwnd,const RECT& rect) {
     Reentry=false;
     return moved;
 }
-void MoveActivatedChrome(Shared* shared,HWND hwnd,Placement* placement) {
+void MoveActivatedWindow(Shared* shared,HWND hwnd,Placement* placement) {
     const Transaction& tx=placement->tx;
     WINDOWPLACEMENT before{sizeof(before)};
     if (!GetWindowPlacement(hwnd,&before)) return;
     const RECT normal=NormalOnTarget(hwnd,tx,before);
-    // Chromium can leave the compositor blank after a visible cross-monitor
-    // move. Restoring from minimized restarts rendering at the new bounds.
+    // Complete activation before changing display/rendering state. Use the
+    // ordinary minimize/placement/restore lifecycle for every application;
+    // rewriting a live activation's WINDOWPOS can desynchronize a compositor.
     Reentry=true;
     ShowWindow(hwnd,SW_SHOWMINNOACTIVE);
     WINDOWPLACEMENT minimized{sizeof(minimized)};
@@ -305,6 +312,12 @@ void VerifyPlacement(Shared* shared,HWND hwnd,Placement* placement) {
         placement->verifyAt=now+PlacementSettleMs;
         ApplyVisibleRect(hwnd,rect);
         return;
+    }
+    if (!onTarget && (tx.entry.flags&TF_AFTER_SHOW)) {
+        // An unsuccessful native attempt is not the end of a verified click.
+        // Leave the epoch readable so its bounded backup can take ownership.
+        Event(shared,TF_POSITION_REJECTED,hwnd,&tx);
+        RemovePlacement(hwnd,placement); return;
     }
     if (CancelTransaction(shared,tx)) {
         if (!onTarget) Event(shared,TF_POSITION_REJECTED,hwnd,&tx);
@@ -338,7 +351,7 @@ LRESULT CALLBACK PlacementProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lpara
             && IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
             placement->verifyAt=Now()+PlacementSettleMs;
             if (MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST)!=Monitor(placement->tx.monitor))
-                MoveActivatedChrome(shared,hwnd,placement);
+                MoveActivatedWindow(shared,hwnd,placement);
         }
         return 0;
     }
@@ -473,12 +486,8 @@ bool PositionVisible(Shared* shared,HWND hwnd,const Transaction& tx) {
     }
     RECT r{};
     if (!VisibleRectOnTarget(hwnd,tx,r)) return false;
-    UINT visibleMoveMessage=0;
-    if (IsWindowVisible(hwnd) && (_wcsicmp(tx.entry.appId,L"Chrome")==0 || _wcsnicmp(tx.entry.appId,L"Chrome.",7)==0)
-        && ClassIs(hwnd,L"Chrome_WidgetWin_1")) {
-        static const UINT message=RegisterWindowMessageW(L"TaskbarFollow.Native.MoveActivatedChrome");
-        visibleMoveMessage=message;
-    }
+    static const UINT message=RegisterWindowMessageW(L"TaskbarFollow.Native.MoveActivatedWindow");
+    const UINT visibleMoveMessage=message;
     if (!Attach(hwnd,tx,r,IsZoomed(hwnd)!=FALSE,false,true,visibleMoveMessage)) return false;
     if (visibleMoveMessage && PostMessageW(hwnd,visibleMoveMessage,tx.serial,tx.epoch)) return true;
     const BOOL moved=!visibleMoveMessage && ApplyVisibleRect(hwnd,r);
@@ -492,7 +501,8 @@ bool PositionVisible(Shared* shared,HWND hwnd,const Transaction& tx) {
                 PlacementCall call(placement); RemovePlacement(hwnd,placement);
             }
         }
-        if (CancelTransaction(shared,tx)) Event(shared,TF_POSITION_REJECTED,hwnd,&tx);
+        if ((tx.entry.flags&TF_AFTER_SHOW) ? StillCurrent(shared,tx) : CancelTransaction(shared,tx))
+            Event(shared,TF_POSITION_REJECTED,hwnd,&tx);
     }
     return onTarget;
 }
@@ -513,6 +523,7 @@ LRESULT CALLBACK Cbt(int code,WPARAM wparam,LPARAM lparam) {
     if (code<0 || Reentry) return CallNextHookEx(nullptr,code,wparam,lparam);
     Shared* shared=GetShared(); Transaction tx;
     if (!Snapshot(shared,tx)) return CallNextHookEx(nullptr,code,wparam,lparam);
+    if (FallbackOwns(shared,tx)) return CallNextHookEx(nullptr,code,wparam,lparam);
     if (tx.entry.flags&TF_COMPATIBILITY) return CallNextHookEx(nullptr,code,wparam,lparam);
     HWND hwnd=reinterpret_cast<HWND>(wparam);
     if (code==HCBT_DESTROYWND && ((tx.preview && Candidate(tx,hwnd))
@@ -592,22 +603,24 @@ bool CacheHit(Shared* shared,POINT point,HWND root,NativeEntry& entry) {
     }
     return false;
 }
-void Arm(Shared* shared,const NativeEntry& entry,HMONITOR monitor,HWND before,bool preview) {
-    Transaction tx{}; tx.entry=entry; tx.monitor=Id(monitor); tx.before=Id(before);
+void Arm(Shared* shared,const NativeEntry& entry,HMONITOR monitor,HWND before,bool preview,HWND source=nullptr) {
+    Transaction tx{}; tx.entry=entry; tx.monitor=Id(monitor); tx.before=Id(before); tx.source=Id(source);
     tx.target.cbSize=sizeof(tx.target);
     if (!GetMonitorInfoW(monitor,&tx.target)) return;
-    tx.released=Now(); tx.expires=tx.released+(preview ? 1800 : static_cast<unsigned>(Read32(shared->timeoutMs))); tx.preview=preview?1u:0u;
+    tx.released=Now(); tx.expires=tx.released+((entry.flags&TF_SHELL_LAUNCH)?2000:(preview ? 1800 : static_cast<unsigned>(Read32(shared->timeoutMs)))); tx.preview=preview?1u:0u;
     tx.serial=static_cast<unsigned>(InterlockedIncrement(&shared->serial));
     tx.epoch=static_cast<unsigned>(InterlockedIncrement(&shared->inputEpoch));
     InterlockedIncrement(&shared->txSequence);
     shared->tx=tx;
     InterlockedExchange64(&shared->claim,static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32));
+    InterlockedExchange64(&shared->fallback,static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32));
     MemoryBarrier(); InterlockedIncrement(&shared->txSequence);
     InterlockedIncrement64(&shared->armed); Event(shared,TF_ARMED,nullptr,&tx);
 }
 struct ClickState {
     NativeEntry entry{}; POINT down{}; HMONITOR monitor{}; HWND before{};
-    std::uint64_t downAt{}, hoverAt{}; bool valid{}, preview{}, group{};
+    std::uint64_t downAt{}, hoverAt{}; bool valid{}, preview{}, group{}, shell{};
+    HWND source{};
     unsigned epoch{};
 };
 ClickState Click;
@@ -627,6 +640,40 @@ void RefreshHoverEntry(Shared* shared) {
             return;
         }
     }
+}
+bool FindHoverEntry(Shared* shared,HWND source,DWORD pid,HMONITOR monitor,NativeEntry& found) {
+    if (Now()-static_cast<std::uint64_t>(Read64(shared->cacheAt))>3000) return false;
+    const LONG sequence=Read32(shared->cacheSequence),index=Read32(shared->cacheIndex);
+    if (sequence&1) return false;
+    bool matched=false;
+    for (unsigned i=0;i<shared->count[index];++i) {
+        const NativeEntry& item=shared->entries[index][i];
+        if (MonitorFromWindow(Window(item.taskbar),MONITOR_DEFAULTTONEAREST)!=monitor) continue;
+        for (unsigned n=0;n<item.count;++n) {
+            if (item.windows[n].hwnd==Id(source) && item.windows[n].pid==pid) {
+                if (matched && wcscmp(item.appId,found.appId)!=0) return false;
+                found=item; matched=true; break;
+            }
+        }
+    }
+    MemoryBarrier();
+    return matched && sequence==Read32(shared->cacheSequence);
+}
+bool ShellLaunchSurface(HWND root) {
+    if (!root || ShellBar(root) || Preview(root)) return false;
+    // Shell windows cover desktop shortcuts and modern desktop menus. Native
+    // menus also cover commands that open a separate application. This never
+    // treats an ordinary click inside an application as a launch intent.
+    DWORD pid{},shellPid{};
+    GetWindowThreadProcessId(root,&pid); GetWindowThreadProcessId(GetShellWindow(),&shellPid);
+    return ClassIs(root,L"#32768") || (pid && pid==shellPid);
+}
+bool ReleaseShellLaunch(Shared* shared,HMONITOR target,HWND before,HWND source) {
+    NativeEntry launch{}; launch.flags=TF_SHELL_LAUNCH;
+    Arm(shared,launch,target,before,false,source);
+    if (ControllerOwner && PostMessageW(ControllerOwner,CompatibilityCommand,
+        static_cast<WPARAM>(Read32(shared->serial)),reinterpret_cast<LPARAM>(target))) return true;
+    Cancel(shared); return false;
 }
 bool ReleaseEntry(Shared* shared,const NativeEntry& entry,HMONITOR target,HWND before,bool preview) {
     if (wcscmp(entry.appId,L"TaskbarFollow.Status")==0 && entry.count==1
@@ -672,6 +719,7 @@ LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
         if (hadPrevious) { InterlockedIncrement64(&shared->cancelled); Event(shared,TF_CANCEL,nullptr,&previous); }
         HWND root=GetAncestor(WindowFromPoint(input.pt),GA_ROOT); NativeEntry entry{};
         const bool isPreview=Preview(root);
+        Click.shell=false;
         if (isPreview) RefreshHoverEntry(shared);
         if (!Modified() && Now()>=static_cast<std::uint64_t>(Read64(shared->coolUntil))
             && ((ShellBar(root) && CacheHit(shared,input.pt,root,entry))
@@ -681,6 +729,11 @@ LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
             Click.monitor=MonitorFromPoint(input.pt,MONITOR_DEFAULTTONEAREST);
             Click.preview=isPreview; Click.valid=true;
             Click.epoch=static_cast<unsigned>(Read32(shared->inputEpoch));
+        } else if (!Modified() && Now()>=static_cast<std::uint64_t>(Read64(shared->coolUntil)) && ShellLaunchSurface(root)) {
+            Click.down=input.pt; Click.downAt=Now(); Click.before=GetForegroundWindow();
+            Click.monitor=MonitorFromPoint(input.pt,MONITOR_DEFAULTTONEAREST);
+            Click.source=root; Click.preview=false; Click.shell=true; Click.valid=true;
+            Click.epoch=static_cast<unsigned>(Read32(shared->inputEpoch));
         }
     } else if (message==WM_LBUTTONUP && Click.valid) {
         Click.valid=false;
@@ -688,7 +741,9 @@ LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
             && abs(input.pt.x-Click.down.x)<=std::max(4,GetSystemMetrics(SM_CXDRAG))
             && abs(input.pt.y-Click.down.y)<=std::max(4,GetSystemMetrics(SM_CYDRAG))) {
             Click.hoverAt=Now();
-            ReleaseEntry(shared,Click.entry,Click.monitor,Click.before,Click.preview);
+            if (Click.shell) {
+                ReleaseShellLaunch(shared,Click.monitor,Click.before,Click.source);
+            } else ReleaseEntry(shared,Click.entry,Click.monitor,Click.before,Click.preview);
         }
     } else if (message==WM_RBUTTONDOWN || message==WM_MBUTTONDOWN || message==WM_XBUTTONDOWN
         || message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL) {
@@ -789,16 +844,16 @@ DWORD RunInputThread() {
                 auto* request=reinterpret_cast<PeekRequest*>(message.lParam);
                 POINT point{}; GetPhysicalCursorPos(&point);
                 HWND root=GetAncestor(WindowFromPoint(point),GA_ROOT);
-                RefreshHoverEntry(Controller.data);
-                bool matched=false;
+                NativeEntry hovered{};
+                const HMONITOR hoverMonitor=MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST);
+                const bool matched=FindHoverEntry(Controller.data,request->source,request->pid,hoverMonitor,hovered);
                 Transaction active;
-                for (unsigned i=0;i<Click.entry.count;++i)
-                    if (Click.entry.windows[i].hwnd==Id(request->source) && Click.entry.windows[i].pid==request->pid) matched=true;
                 if (Read32(PeekEnabled) && request->generation==Read32(PeekGeneration) && Live(Controller.data)
                     && root==request->popup && Preview(root) && matched && !Click.valid && !Snapshot(Controller.data,active)
                     && abs(point.x-request->point.x)<=8 && abs(point.y-request->point.y)<=8
                     && !(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !Modified()
                     && MonitorFromWindow(request->source,MONITOR_DEFAULTTONEAREST)!=MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST)) {
+                    SetHoverEntry(hovered); Click.monitor=hoverMonitor;
                     const HWND before=PeekUi.Source();
                     if (PeekUi.Show(request->source,request->pid,root,MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST))) {
                         Click.hoverAt=Now();
@@ -995,6 +1050,16 @@ BOOL TF_Status(NativeStatus* status,unsigned bytes) {
     status->lastWindow=Read64(shared->lastWindow); status->latency=Read64(shared->latency); status->eventNumber=Read64(shared->eventNumber);
     wcsncpy_s(status->target,shared->target,_TRUNCATE); return TRUE;
 }
+unsigned TF_IntentBytes() { return sizeof(NativeIntent); }
+BOOL TF_BeginFallback(unsigned serial) {
+    if (!Controller.data) return FALSE;
+    Transaction tx;
+    if (!Snapshot(Controller.data,tx) || tx.serial!=serial || !(tx.entry.flags&TF_AFTER_SHOW)) return FALSE;
+    const LONG64 empty=static_cast<LONG64>(static_cast<std::uint64_t>(serial)<<32),owned=empty|1;
+    const LONG64 previous=InterlockedCompareExchange64(&Controller.data->fallback,owned,empty);
+    Transaction current;
+    return (previous==empty || previous==owned) && Snapshot(Controller.data,current) && current.serial==serial;
+}
 BOOL TF_CompatibilityIntent(unsigned serial,NativeIntent* intent,unsigned bytes) {
     if (!Controller.data || !intent || bytes!=sizeof(*intent)) return FALSE;
     Transaction tx;
@@ -1004,6 +1069,7 @@ BOOL TF_CompatibilityIntent(unsigned serial,NativeIntent* intent,unsigned bytes)
     intent->entry=tx.entry; intent->monitor=tx.monitor; intent->released=tx.released;
     intent->expires=tx.expires; intent->serial=tx.serial;
     intent->nativeClaimed=(claim>>32)==tx.serial && static_cast<unsigned>(claim)!=0;
+    intent->before=tx.before; intent->source=tx.source;
     return TRUE;
 }
 BOOL TF_CancelCompatibility(unsigned serial) {
@@ -1038,6 +1104,13 @@ BOOL TF_TestArm(const wchar_t* path,HWND window,HMONITOR target) {
     if (window) { DWORD pid{}; GetWindowThreadProcessId(window,&pid); entry.count=1; entry.windows[0]={Id(window),pid,0}; }
     Arm(Controller.data,entry,target,nullptr,false); return TRUE;
 }
+BOOL TF_TestShellLaunch(HWND source,HMONITOR target) {
+    DWORD pid{}; GetWindowThreadProcessId(source,&pid);
+    MONITORINFO info{sizeof(info)};
+    if (!Controller.data || !(StartFlags&TF_TEST_MODE) || pid!=GetCurrentProcessId()
+        || !IsWindow(source) || !GetMonitorInfoW(target,&info) || !Live(Controller.data)) return FALSE;
+    return ReleaseShellLaunch(Controller.data,target,source,source)?TRUE:FALSE;
+}
 BOOL TF_TestArmIdentity(const wchar_t* path,const wchar_t* appId,HMONITOR target) {
     if (!TF_TestArm(path,nullptr,target) || !appId || wcslen(appId)>=256) return FALSE;
     NativeEntry entry{}; wcsncpy_s(entry.path,path,_TRUNCATE); wcsncpy_s(entry.appId,appId,_TRUNCATE);
@@ -1063,12 +1136,30 @@ HWND TF_TestPeek(HWND source,HWND popup,HMONITOR target,BOOL show) {
     return testPeek.Show(source,pid,popup,target) ? testPeek.Host() : nullptr;
 }
 unsigned TF_HoverCandidates(NativeCandidate* candidates,unsigned capacity) {
-    if (!Controller.data || !candidates || capacity<TF_MAX_WINDOWS) return 0;
-    if (!TryAcquireSRWLockShared(&ClickLock)) return 0;
-    unsigned count=Click.entry.count;
-    if (count<=TF_MAX_WINDOWS) memcpy(candidates,Click.entry.windows,count*sizeof(NativeCandidate));
-    else count=0;
-    ReleaseSRWLockShared(&ClickLock); return count;
+    if (!Controller.data || !candidates || capacity<TF_MAX_WINDOWS || !Live(Controller.data)) return 0;
+    auto* shared=Controller.data;
+    if (Now()-static_cast<std::uint64_t>(Read64(shared->cacheAt))>3000) return 0;
+    POINT point{}; if (!GetPhysicalCursorPos(&point) || !Preview(GetAncestor(WindowFromPoint(point),GA_ROOT))) return 0;
+    const HMONITOR monitor=MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST);
+    const LONG sequence=Read32(shared->cacheSequence),index=Read32(shared->cacheIndex);
+    if (sequence&1) return 0;
+    unsigned count=0;
+    // Resolve the popup's actual title against the current cache, never against
+    // whichever taskbar button happened to receive the previous mouse move.
+    for (unsigned i=0;i<shared->count[index];++i) {
+        const NativeEntry& item=shared->entries[index][i];
+        if (MonitorFromWindow(Window(item.taskbar),MONITOR_DEFAULTTONEAREST)!=monitor) continue;
+        for (unsigned n=0;n<item.count;++n) {
+            bool duplicate=false;
+            for (unsigned p=0;p<count;++p)
+                if (candidates[p].hwnd==item.windows[n].hwnd && candidates[p].pid==item.windows[n].pid) duplicate=true;
+            if (!duplicate) {
+                if (count==TF_MAX_WINDOWS) return 0; // incomplete sets cannot prove an unambiguous title
+                candidates[count++]=item.windows[n];
+            }
+        }
+    }
+    MemoryBarrier(); return sequence==Read32(shared->cacheSequence)?count:0;
 }
 BOOL TF_AccessibleName(int x,int y,wchar_t* name,unsigned capacity) {
     if (!name || capacity<2 || capacity>32768) return FALSE;

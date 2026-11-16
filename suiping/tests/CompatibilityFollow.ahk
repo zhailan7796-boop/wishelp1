@@ -44,7 +44,7 @@ class CompatibilityChecks {
         return 1
     }
     static NativeIntent(serial,snapshot,bytes) {
-        if serial != 7 || bytes != 3136
+        if serial != 7 || bytes != 3152
             return 0
         NumPut("uint",5,"uint",this.AbiCount,snapshot,24)
         StrPut("Fixture.App",snapshot+32,256)
@@ -57,7 +57,7 @@ class CompatibilityChecks {
     }
 }
 class CompatibilityOwner {
-    Enabled := true, SuccessfulMoves := 0, Messages := [], Logs := []
+    Enabled := true, BringActive := true, SuccessfulMoves := 0, Messages := [], Logs := []
     __New() {
         this.Identity := WindowIdentity("",false)
         this.Identity.Mappings["Fixture.App"] := A_AhkPath
@@ -69,11 +69,13 @@ class CompatibilityFixture extends NativeEngine {
     __New(warm := true) {
         this.Owner := CompatibilityOwner(), this.Handle := 1, this.Compatibility := 0, this.CompatibilityMoves := 0
         this.Now := 1000, this.Valid := true, this.Selected := CompatibilityChecks.Window()
-        this.Intent := {Serial:7,Flags:5,Id:"Fixture.App",Path:A_AhkPath,Monitor:2,Released:900,Expires:9000,NativeClaimed:0,
+        this.Intent := {Serial:7,Flags:5,Id:"Fixture.App",Path:A_AhkPath,Monitor:2,Released:900,Expires:9000,NativeClaimed:0,Before:0,Source:0,
             Candidates:warm ? [{Hwnd:11,Pid:101}] : []}
         this.Requests := [], this.Scheduled := false, this.ScheduleStarts := 0, this.NativeCancels := 0
         this.MoveResult := "requested", this.IntentReads := 0, this.CancelAtRead := 0
         this.ForegroundReads := 0, this.InterruptAtForeground := 0, this.InterruptKind := ""
+        this.WindowSnapshot := 0
+        this.TakeoverAllowed := true
         this.ReplaceAtRead := 0, this.ReplaceDuringCompare := false, this.ReplaceNativeOnlyDuringCompare := false
         this.CompareCritical := 0, this.MoveCritical := 0
     }
@@ -92,6 +94,8 @@ class CompatibilityFixture extends NativeEngine {
         return this.Valid && serial = this.Intent.Serial ? this.Intent : 0
     }
     CompatibilityNow() => this.Now
+    CompatibilityTakeover(serial) => this.TakeoverAllowed && this.Valid && serial = this.Intent.Serial
+    CompatibilitySnapshot(hwnd) => IsObject(this.WindowSnapshot) && this.WindowSnapshot.Hwnd = hwnd ? this.WindowSnapshot : 0
     CompatibilityMonitor(handle) => CompatibilityChecks.Monitor(handle)
     CompatibilitySchedule(enabled) {
         this.Scheduled := enabled
@@ -341,6 +345,58 @@ try {
     CompatibilityChecks.Assert(!IsObject(decoder.ReadCompatibilityIntent(8)),"A failed native serial read never returns an invented intent")
     CompatibilityChecks.AbiCount := 33
     CompatibilityChecks.Assert(!IsObject(decoder.ReadCompatibilityIntent(7)),"A malformed over-capacity native candidate count is rejected")
+
+    fixture := CompatibilityFixture(), fixture.Intent.Flags := 17, fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1,"An arbitrary verified 64-bit application has after-show backup")
+    fixture := CompatibilityFixture(), fixture.TakeoverAllowed := false, fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"A failed serial-specific handoff cannot issue a competing move")
+    fixture := CompatibilityFixture(), fixture.Intent.Flags := 17, fixture.Intent.Before := 11
+    fixture.WindowSnapshot := fixture.Selected, fixture.WindowSnapshot.Minimized := true, fixture.Selected := 0
+    fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1 && fixture.Compatibility.Recovering,
+        "An already-active cross-screen click can rescue its exact window when Explorer minimized it without a native hook")
+    fixture.WindowSnapshot.Minimized := false, fixture.WindowSnapshot.Monitor := CompatibilityChecks.Monitor(2)
+    fixture.Now += 50, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(fixture.CompatibilityMoves = 1,"The rescued window is counted only after it is visibly restored on target")
+    fixture := CompatibilityFixture(), fixture.Intent.Flags := 17, fixture.Intent.Before := 11, fixture.Owner.BringActive := false
+    fixture.WindowSnapshot := fixture.Selected, fixture.WindowSnapshot.Minimized := true, fixture.Selected := 0
+    fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"Disabling active-window following preserves Explorer's minimize behavior")
+    fixture := CompatibilityFixture(), fixture.Intent.Flags := 19, fixture.Intent.NativeClaimed := 1
+    fixture.Selected.Data.AppId := "Fixture.App", fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"A claimed ordinary/package window gets time to finish natively")
+    fixture.Now += 500, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1,"A native claim that never completes cannot disable backup forever")
+
+    fixture := CompatibilityFixture(), fixture.Intent.Flags := 16, fixture.Intent.Path := ""
+    fixture.Selected.Data.Path := "", fixture.Selected.Data.AppId := "Fixture.App"
+    fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1,"A shared application frame with an exact cached HWND/PID/AppID does not require process-path access")
+    fixture := CompatibilityFixture(), fixture.Intent.Flags := 16, fixture.Intent.Path := ""
+    fixture.Selected.Data.AppId := "Other.App", fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"A frame whose application identity changed is rejected")
+
+    for excluded in ["Before","Source"] {
+        fixture := CompatibilityFixture(false), fixture.Intent.Flags := 32, fixture.Intent.Path := "", fixture.Intent.Id := ""
+        fixture.Intent.%excluded% := fixture.Selected.Hwnd, fixture.BeginCompatibility(7,2)
+        CompatibilityChecks.NoRequest(fixture,"A shell click cannot move its existing foreground/source window: " . excluded)
+    }
+    fixture := CompatibilityFixture(false), fixture.Intent.Flags := 32, fixture.Intent.Path := "", fixture.Intent.Id := ""
+    fixture.Intent.Before := 20, fixture.Intent.Source := 21
+    fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1,"A different application appearing after an explicit shell launch follows the source screen")
+    fixture.Valid := false, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(!fixture.Scheduled,"Any new input cancels the shell-launch backup")
+
+    candidates := [{Hwnd:1,Pid:101,Title:"Browser"},{Hwnd:2,Pid:102,Title:"Reader"}]
+    hover := NativeEngine.HoverMatches(candidates,["Reader"])
+    CompatibilityChecks.Assert(hover.Length = 1 && hover[1].Hwnd = 2,"The current thumbnail title resolves the reader even with a stale browser context")
+    CompatibilityChecks.Assert(NativeEngine.HoverMatches([candidates[1]],["Reader"]).Length = 0,
+        "A single cached candidate never bypasses thumbnail-title verification")
+    hover := NativeEngine.HoverMatches([candidates[2],{Hwnd:3,Pid:103,Title:"Reader"}],["Reader"])
+    CompatibilityChecks.Assert(hover.Length = 2,"Duplicate titles remain ambiguous and cannot produce a custom preview")
+    CompatibilityChecks.Assert(NativeEngine.HoverMatches([{Hwnd:4,Pid:104,Title:""}],[""]).Length = 0,"Empty names cannot match a thumbnail")
 
     FileAppend("PASS compatibility-follow assertions=" . CompatibilityChecks.Count . "`n", "*", "UTF-8")
 } catch as e {

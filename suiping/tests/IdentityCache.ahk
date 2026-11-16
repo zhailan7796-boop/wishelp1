@@ -87,9 +87,13 @@ class IdentityCacheChecks {
             path := ""
         cold := path != "" && FileExist(path) && RegExMatch(path,"i)^[a-z]:\\.*\.exe$")
         requireId := cold && identity.NativeRequiresAppId(id,path)
-        binaryType := 0
-        compatibility := cold && DllCall("kernel32\GetBinaryTypeW","wstr",path,"uint*",&binaryType) && binaryType = 0
-        return {Id:id,Path:path,Candidates:candidates,Flags:(cold?1:0)|(requireId?2:0)|(compatibility?4:0)}
+        binaryType := -1
+        if cold && !DllCall("kernel32\GetBinaryTypeW","wstr",path,"uint*",&binaryType)
+            binaryType := -1
+        compatibility := binaryType = 0
+        packaged := binaryType = 6 && !candidates.Length && WindowIdentity.PackageId(id)
+        backup := !compatibility && !packaged && (binaryType = 6 || candidates.Length)
+        return {Id:id,Path:path,Candidates:candidates,Flags:(cold?1:0)|(requireId?2:0)|(compatibility?4:0)|(packaged?8:0)|(backup?16:0)}
     }
     static LegacyButtons(buttons,windows,identity) {
         records := []
@@ -226,7 +230,7 @@ try {
     manyEntry := NativeEngine.ResolveEntry("Local.Many",many,ids,manyIndex)
     IdentityCacheChecks.Equal(manyEntry.Candidates.Length,32,"Candidate ABI remains capped at 32")
     IdentityCacheChecks.Equal(manyEntry.Candidates[32].Hwnd,32,"Candidate cap retains first windows")
-    IdentityCacheChecks.Assert(manyEntry.Path = "" && manyEntry.Flags = 0,"The 33rd path prevents ambiguous cold launch")
+    IdentityCacheChecks.Assert(manyEntry.Path = "" && manyEntry.Flags = 16,"The 33rd path prevents ambiguous cold launch while verified windows retain backup")
     IdentityCacheChecks.SameEntry(manyEntry,IdentityCacheChecks.LegacyEntry("Local.Many",many,ids),"Full path ambiguity beyond candidate cap")
 
     shared := IdentityCacheChecks.Identity()
