@@ -18,6 +18,7 @@ constexpr int ActivationCase=0, NormalRestoreCase=1, MaximizedRestoreCase=2;
 constexpr int ChromeActivationCase=5, ChromeMaximizedActivationCase=6;
 constexpr int ElectronActivationCase=7, BorderlessActivationCase=8, OtherRendererActivationCase=9;
 constexpr int FallbackOwnershipCase=10;
+constexpr int SystemRestoreCase=11, SystemActivationCase=12, UnawareRestoreCase=13, UnawareActivationCase=14;
 constexpr COLORREF InitialColor=RGB(28,73,132);
 constexpr COLORREF RestoredColor=RGB(31,137,91);
 struct FixtureState {
@@ -26,6 +27,7 @@ struct FixtureState {
     LONG sizeWidth, sizeHeight, paintWidth, paintHeight, paintedColor;
     LONG clientWidth, clientHeight, iconic, maximized, finalFlags, activeBefore, activeAfter;
     LONG interruptMode, interruptions, interruptSucceeded, movedDuringActivation, minimizedAfterActivation;
+    LONG expectedAwareness, dpiMismatches;
     RECT before, after;
 };
 FixtureState* Fixture{};
@@ -74,6 +76,8 @@ void WaitForFixture(HANDLE event,HANDLE process,const char* label) {
     }
 }
 LRESULT CALLBACK FixtureProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam) {
+    if (Fixture && GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext())!=Fixture->expectedAwareness)
+        ++Fixture->dpiMismatches;
     if (message==FallbackPlacementMessage) {
         WINDOWPLACEMENT placement{sizeof(placement)};
         MONITORINFO target{sizeof(target)};
@@ -176,8 +180,13 @@ int RunFixture(int argc,wchar_t** argv) {
     Observed=OpenEventW(EVENT_MODIFY_STATE,FALSE,observedName.c_str());
     if (!ready || !Observed) return 5;
     const int scenario=_wtoi(argv[5]);
-    ChromeActivation=scenario>=ChromeActivationCase;
-    VisibleActivation=scenario==ActivationCase || ChromeActivation;
+    if (scenario==SystemRestoreCase || scenario==SystemActivationCase)
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+    if (scenario==UnawareRestoreCase || scenario==UnawareActivationCase)
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+    Fixture->expectedAwareness=GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+    ChromeActivation=scenario>=ChromeActivationCase && scenario<=FallbackOwnershipCase;
+    VisibleActivation=scenario==ActivationCase || ChromeActivation || scenario==SystemActivationCase || scenario==UnawareActivationCase;
     WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=FixtureProc;
     cls.lpszClassName=scenario==OtherRendererActivationCase?L"TaskbarFollow.UnlistedRenderer":
         (ChromeActivation?L"Chrome_WidgetWin_1":L"TaskbarFollow.NativePaintFixture");
@@ -256,7 +265,8 @@ struct Child {
         WaitForFixture(ready,process,"fixture initial paint/state handshake");
         printf("native paint initial paints=%ld color=%06lx\n",state->initialPaints,state->initialColor);
         Check(state->initialPaints>0 && state->initialColor==static_cast<LONG>(InitialColor),"fixture initially painted real colored content");
-        if (scenario==ActivationCase || scenario>=ChromeActivationCase) {
+        if (scenario==ActivationCase || (scenario>=ChromeActivationCase && scenario<=FallbackOwnershipCase)
+            || scenario==SystemActivationCase || scenario==UnawareActivationCase) {
             Check(IsWindowVisible(Window()) && !IsIconic(Window()),"activation fixture initially visible");
             Check(state->activeBefore!=0,"owned anchor became active on the private desktop");
         } else Check(IsIconic(Window())!=FALSE,"fixture initially minimized");
@@ -310,10 +320,10 @@ int wmain(int argc,wchar_t** argv) {
         MONITORINFO source{sizeof(source)}; Check(GetMonitorInfoW(monitors[0],&source)!=FALSE,"source monitor info");
         ControllerTarget=monitors[1];
         Check(Start(nullptr,TF_TEST_MODE)!=FALSE,"native paint controller startup");
-        for (int scenario=ActivationCase;scenario<=FallbackOwnershipCase;++scenario) {
-            const bool chrome=scenario>=ChromeActivationCase;
-            const int interruption=scenario>=3 && !chrome?scenario-2:0;
-            const bool activation=scenario==ActivationCase || interruption || chrome;
+        for (int scenario=ActivationCase;scenario<=UnawareActivationCase;++scenario) {
+            const bool chrome=scenario>=ChromeActivationCase && scenario<=FallbackOwnershipCase;
+            const int interruption=scenario==3 || scenario==4?scenario-2:0;
+            const bool activation=scenario==ActivationCase || interruption || chrome || scenario==SystemActivationCase || scenario==UnawareActivationCase;
             const bool maximized=scenario==MaximizedRestoreCase || scenario==ChromeMaximizedActivationCase;
             Child child;
             child.Spawn(L"Local\\TaskbarFollow.NativePaint."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(scenario),
@@ -340,6 +350,7 @@ int wmain(int argc,wchar_t** argv) {
             WaitForFixture(child.observed,child.process,"fixture placement observation handshake");
             NativeStatus after{}; Check(Status(&after,sizeof(after))!=FALSE,"post-placement status");
             const FixtureState& state=*child.state;
+            Check(!state.dpiMismatches,"native positioning preserved the application's own window-procedure DPI context");
             if (scenario==FallbackOwnershipCase) {
                 Check(EqualRect(&state.before,&state.after) && after.activated==before.activated,
                     "native activation yields after fallback takeover");
@@ -413,8 +424,9 @@ int wmain(int argc,wchar_t** argv) {
                 && state.paintMonitor==reinterpret_cast<UINT_PTR>(monitors[1]),
                 "placed client repainted colored content at its final size on the target monitor");
             printf("PASS native repaint: %s moved to target with coherent client size and fresh colored content\n",
-                scenario>=ElectronActivationCase?"unlisted/custom-title-bar activation":
-                    (chrome?"normal Chrome activation":(activation?"visible activation":(maximized?"maximized restore":"normal restore"))));
+                scenario>=SystemRestoreCase?(scenario>=UnawareRestoreCase?"DPI-unaware application":"system-DPI application"):
+                (scenario>=ElectronActivationCase?"unlisted/custom-title-bar activation":
+                    (chrome?"normal Chrome activation":(activation?"visible activation":(maximized?"maximized restore":"normal restore")))));
         }
         Check(Stop(3000)!=FALSE,"native paint controller stop");
         FreeLibrary(dll); dll=nullptr; exitCode=0;

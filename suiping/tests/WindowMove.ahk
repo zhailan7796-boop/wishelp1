@@ -2,6 +2,90 @@
 #Include ..\lib\Native.ahk
 Desktop.Physical()
 Log(text) => FileAppend(text . "`n", "*", "UTF-8")
+Refresh(hwnd,target) {
+    operation := WindowMoveOperation(hwnd,target)
+    result := operation.Start()
+    if result != "requested"
+        return result
+    return Finish(operation)
+}
+Finish(operation) {
+    deadline := Desktop.Tick()+1000
+    while Desktop.Tick()<deadline {
+        result := operation.Advance()
+        if result = "complete"
+            return "requested"
+        if result != "waiting"
+            break
+        Sleep(30)
+    }
+    operation.Cancel()
+    return result
+}
+WaitFor(observation,label) {
+    deadline := Desktop.Tick()+1000
+    while Desktop.Tick()<deadline {
+        if observation()
+            return
+        Sleep(20)
+    }
+    throw Error(label)
+}
+ForeignCases(executable,one,two) {
+    unique := "TaskbarFollow foreign move " . DllCall("kernel32\GetCurrentProcessId","uint") . "-" . A_TickCount
+    hwnd := 0, focus := Desktop.Foreground(), anchor := 0
+    Run('"' . executable . '" /ErrorStdOut=UTF-8 "' . A_ScriptDir . '\WindowMoveFixture.ahk" "' . unique . '"',,"Hide",&child)
+    try {
+        if !WinWait(unique . " ahk_pid " . child,,3)
+            throw Error("Foreign movement fixture did not start")
+        hwnd := WinExist(unique . " ahk_pid " . child)
+        if WindowMover.Move(hwnd,one,true) != "already-there"
+            WaitFor(() => Desktop.SameMonitor(Desktop.MonitorOf(hwnd),one),"Foreign fixture setup did not move")
+        if Refresh(hwnd,two) != "requested" || Desktop.IsMin(hwnd)
+            throw Error("Foreign normal refresh failed")
+        DllCall("user32\ShowWindowAsync","ptr",hwnd,"int",3)
+        WaitFor(() => NumGet(Desktop.Placement(hwnd),8,"uint")=3,"Foreign fixture did not maximize")
+        if Refresh(hwnd,one) != "requested" || NumGet(Desktop.Placement(hwnd),8,"uint") != 3
+            throw Error("Foreign maximized refresh failed")
+        DllCall("user32\ShowWindowAsync","ptr",hwnd,"int",7)
+        WaitFor(() => Desktop.IsMin(hwnd),"Foreign fixture did not minimize")
+        operation := WindowMoveOperation(hwnd,two,true)
+        if operation.Start() != "requested" || Finish(operation) != "requested"
+            || NumGet(Desktop.Placement(hwnd),8,"uint") != 3
+            throw Error("Foreign minimized-maximized refresh failed")
+        operation := WindowMoveOperation(hwnd,one)
+        if operation.Start() != "requested"
+            throw Error("Foreign cancellation setup failed")
+        WaitFor(() => Desktop.IsMin(hwnd),"Foreign cancellation did not reach minimization")
+        anchor := Gui("+ToolWindow","TaskbarFollow move cancellation anchor")
+        anchor.Show("w240 h90")
+        focusBeforeCancel := Desktop.Foreground()
+        operation.Cancel()
+        Sleep(150)
+        if operation.Advance() != "cancelled" || !Desktop.SameMonitor(Desktop.MonitorOf(hwnd),two)
+            || !Desktop.IsMin(hwnd) || !(NumGet(Desktop.Placement(hwnd),4,"uint") & 2)
+            throw Error("Cancellation changed placement/state or resumed the move")
+        if Desktop.Foreground() != focusBeforeCancel
+            throw Error("Cancellation stole focus from the new foreground window")
+        DllCall("user32\ShowWindowAsync","ptr",hwnd,"int",7)
+        WaitFor(() => Desktop.IsMin(hwnd),"Originally minimized cancellation setup failed")
+        operation := WindowMoveOperation(hwnd,one,true)
+        if operation.Start() != "requested"
+            throw Error("Originally minimized cancellation did not start")
+        operation.Cancel()
+        Sleep(150)
+        if !Desktop.IsMin(hwnd) || operation.Advance() != "cancelled"
+            throw Error("Cancelling an originally minimized window restored it")
+        Log("PASS foreign async movement and cancellation; runtime=" . executable)
+    } finally {
+        if IsObject(anchor)
+            anchor.Destroy()
+        if hwnd && Desktop.Pid(hwnd)=child
+            WinClose("ahk_id " . hwnd)
+        if focus
+            try WinActivate("ahk_id " . focus)
+    }
+}
 try {
     if MonitorGetCount() < 2
         throw Error("Need two monitors")
@@ -54,14 +138,14 @@ try {
     Log("max-after=" . Desktop.MonitorOf(g.Hwnd).Device . " max-state=" . NumGet(Desktop.Placement(g.Hwnd), 8, "uint"))
     if !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd), one) || NumGet(Desktop.Placement(g.Hwnd), 8, "uint") != 3
         throw Error("Maximized move failed")
-    if WindowMover.Move(g.Hwnd,two,false,true) != "requested"
+    if Refresh(g.Hwnd,two) != "requested"
         throw Error("Visible maximized refresh was not requested")
     Sleep(350)
     if Desktop.IsMin(g.Hwnd) || !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd),two) || NumGet(Desktop.Placement(g.Hwnd),8,"uint") != 3
         throw Error("Visible refresh did not preserve maximized state on target")
     DllCall("user32\ShowWindow","ptr",g.Hwnd,"int",9)
     Sleep(100)
-    if WindowMover.Move(g.Hwnd,one,false,true) != "requested"
+    if Refresh(g.Hwnd,one) != "requested"
         throw Error("Visible normal refresh was not requested")
     Sleep(350)
     if Desktop.IsMin(g.Hwnd) || !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd),one) || NumGet(Desktop.Placement(g.Hwnd),8,"uint") = 3
@@ -95,6 +179,8 @@ try {
         throw Error("A stale work-area snapshot was accepted")
     Log("PASS normal/maximized/minimized/no-op/stale-monitor native cases")
     g.Destroy()
+    ForeignCases(A_AhkPath,one,two)
+    ForeignCases(A_ScriptDir . "\..\runtime\AutoHotkey32.exe",one,two)
     ExitApp(0)
 } catch as e {
     Log("FAIL " . e.Message . " at " . e.Line)

@@ -29,6 +29,16 @@ struct alignas(8) NativeStatus {
     wchar_t target[32];
 };
 static_assert(sizeof(NativeStatus) == 168, "AHK status ABI");
+struct alignas(8) NativeInputStatus {
+    std::uint64_t number;
+    POINT point;
+    std::uint64_t root, cacheAge;
+    unsigned phase, reason, awareness, cacheSequence, count;
+    int dx, dy;
+    unsigned reserved;
+    wchar_t rootClass[64], appId[256];
+};
+static_assert(sizeof(NativeInputStatus) == 704, "AHK input diagnostic ABI");
 struct alignas(8) NativeIntent {
     NativeEntry entry;
     std::uint64_t monitor, released, expires;
@@ -55,6 +65,7 @@ TF_API void TF_Configure(unsigned timeoutMs, BOOL bringActive);
 TF_API void TF_Cancel(unsigned cooldownMs);
 TF_API BOOL TF_PublishCache(const NativeEntry* entries, unsigned count, unsigned stride);
 TF_API BOOL TF_Status(NativeStatus* status, unsigned bytes);
+TF_API BOOL TF_InputStatus(NativeInputStatus* status, unsigned bytes);
 TF_API BOOL TF_CompatibilityIntent(unsigned serial, NativeIntent* intent, unsigned bytes);
 TF_API unsigned TF_IntentBytes();
 // Atomically hands this exact transaction to the after-show controller. Its
@@ -78,3 +89,5 @@ TF_API BOOL TF_TestLifecycle(HANDLE startupGate, HANDLE shutdownGate,
 TF_API BOOL TF_TestSetUnhookFailure(BOOL enabled);
 TF_API BOOL TF_TestReleaseEntry(const NativeEntry* entry, HMONITOR target, BOOL preview);
 TF_API BOOL TF_TestShellLaunch(HWND source, HMONITOR target);
+// Simulates only this test process's own window callbacks; sends no OS input.
+TF_API BOOL TF_TestMouseInput(unsigned message, int x, int y);

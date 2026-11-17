@@ -23,8 +23,16 @@ try {
     bars := WinGetList("ahk_class Shell_SecondaryTrayWnd")
     if !bars.Length
         throw Error("Secondary taskbar not found")
-    target := Desktop.MonitorOf(bars[1])
-    source := Desktop.MonitorOf(WinExist("ahk_class Shell_TrayWnd"))
+    primaryBar := WinExist("ahk_class Shell_TrayWnd")
+    reverse := false, active := false, maximized := false
+    for argument in A_Args {
+        reverse := reverse || argument = "reverse"
+        active := active || argument = "active"
+        maximized := maximized || argument = "maximized"
+    }
+    targetBar := reverse ? primaryBar : bars[1]
+    target := Desktop.MonitorOf(targetBar)
+    source := Desktop.MonitorOf(reverse ? bars[1] : primaryBar)
     fixture := Gui(, "TaskbarFollow taskbar input regression")
     observedWindow := fixture.Hwnd
     fixture.AddText(, "Temporary test window. No documents are opened.")
@@ -49,9 +57,16 @@ try {
     focus := Gui("+ToolWindow", "TaskbarFollow input test controller")
     focus.AddText(, "Waiting for a real taskbar restore.")
     focus.Show("x" . (source.Work.L + 80) . " y" . (source.Work.T + 80) . " w360 h100")
+    if active {
+        if maximized
+            fixture.Maximize()
+        else
+            fixture.Restore()
+        WinActivate("ahk_id " . fixture.Hwnd)
+    }
     uia := TaskbarUIA(), button := 0, deadline := Desktop.Tick() + 4000
     Loop {
-        for item in uia.Buttons(bars[1]) {
+        for item in uia.Buttons(targetBar) {
             if item.Id = appId {
                 button := item
                 break
@@ -64,11 +79,11 @@ try {
         Sleep(100)
     }
     Log("fixture=" . fixture.Hwnd . "; appid=" . WindowIdentity.WindowAppId(fixture.Hwnd) . "; minimized=" . Desktop.IsMin(fixture.Hwnd))
-    Log("source=" . source.Device . "; target=" . target.Device)
+    Log("source=" . source.Device . "; target=" . target.Device . "; active=" . active . "; maximized=" . maximized)
     ; Native mode resolves a click from the pre-warmed semantic cache. A newly
     ; created test taskbar button must be allowed two cache refreshes first.
     Sleep(1600)
-    for item in uia.Buttons(bars[1]) {
+    for item in uia.Buttons(targetBar) {
         if item.Id = appId {
             button := item
             break
@@ -84,8 +99,13 @@ try {
     SendEvent("{LButton down}")
     Sleep(60)
     SendEvent("{LButton up}")
-    deadline := Desktop.Tick() + 8000, arrivedAt := 0
+    deadline := Desktop.Tick() + 8000, arrivedAt := 0, started := Desktop.Tick(), lastState := ""
     Loop {
+        state := Desktop.IsMin(fixture.Hwnd) . ":" . Desktop.MonitorOf(fixture.Hwnd).Device . ":" . (Desktop.Foreground() = fixture.Hwnd)
+        if state != lastState {
+            Log("state at " . (Desktop.Tick()-started) . "ms=" . state)
+            lastState := state
+        }
         if !Desktop.IsMin(fixture.Hwnd) && Desktop.SameMonitor(Desktop.MonitorOf(fixture.Hwnd), target) {
             if !arrivedAt
                 arrivedAt := Desktop.Tick()
@@ -97,9 +117,10 @@ try {
         Sleep(50)
     }
     if IniRead(A_ScriptDir . "\..\settings.ini","General","Engine","native") = "native" {
-        if firstRestoreMonitor != target.Handle
+        if !active && firstRestoreMonitor != target.Handle
             throw Error("Native restore first became visible on the wrong monitor; first=" . firstRestoreMonitor . "; expected=" . target.Handle)
-        Log("PASS native actual secondary taskbar click -> first visible restore already on target; stable >1700ms")
+        Log(active ? "PASS native active taskbar activation on target; stable >1700ms; reverse=" . reverse
+            : "PASS native actual taskbar click -> first visible restore already on target; stable >1700ms; reverse=" . reverse)
     } else
         Log("PASS actual secondary taskbar click -> own minimized window restored and moved; stable >1700ms")
     fixture.Destroy(), focus.Destroy()

@@ -65,6 +65,11 @@ class CompatibilityOwner {
     ReportActivity(text) => this.Messages.Push(text)
     Log(text) => this.Logs.Push(text)
 }
+class CompatibilityPlan {
+    Advances := 0, Cancels := 0, Result := "waiting"
+    Advance() => (this.Advances += 1,this.Result)
+    Cancel() => this.Cancels += 1
+}
 class CompatibilityFixture extends NativeEngine {
     __New(warm := true) {
         this.Owner := CompatibilityOwner(), this.Handle := 1, this.Compatibility := 0, this.CompatibilityMoves := 0
@@ -94,6 +99,8 @@ class CompatibilityFixture extends NativeEngine {
         return this.Valid && serial = this.Intent.Serial ? this.Intent : 0
     }
     CompatibilityNow() => this.Now
+    PollInput() { ; Native input observations are separate from this OS fixture.
+    }
     CompatibilityTakeover(serial) => this.TakeoverAllowed && this.Valid && serial = this.Intent.Serial
     CompatibilitySnapshot(hwnd) => IsObject(this.WindowSnapshot) && this.WindowSnapshot.Hwnd = hwnd ? this.WindowSnapshot : 0
     CompatibilityMonitor(handle) => CompatibilityChecks.Monitor(handle)
@@ -376,6 +383,47 @@ try {
     fixture := CompatibilityFixture(), fixture.Intent.Flags := 16, fixture.Intent.Path := ""
     fixture.Selected.Data.AppId := "Other.App", fixture.BeginCompatibility(7,2)
     CompatibilityChecks.NoRequest(fixture,"A frame whose application identity changed is rejected")
+
+    fixture := CompatibilityFixture(), fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    plan := CompatibilityPlan(), fixture.Compatibility.MovePlan := plan
+    fixture.WindowSnapshot := fixture.Selected, fixture.WindowSnapshot.Minimized := true, fixture.Selected := 0
+    fixture.Now += 50, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(plan.Advances=1 && fixture.Requests.Length=1 && fixture.Scheduled && !fixture.CompatibilityMoves,
+        "A move's own minimized transition advances only the same HWND/PID and is not counted as success")
+    fixture.WindowSnapshot.Monitor := CompatibilityChecks.Monitor(2)
+    fixture.Now += 50, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(plan.Advances=2 && !fixture.CompatibilityMoves,
+        "A minimized restore rectangle on target is not visible completion")
+    fixture.WindowSnapshot.Minimized := false, fixture.Selected := fixture.WindowSnapshot, plan.Result := "complete"
+    fixture.Now += 50, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(fixture.CompatibilityMoves=1 && fixture.Requests.Length=1 && !fixture.Scheduled,
+        "A staged operation counts once after its visible final state and destination are confirmed")
+    for interruption in ["input","pause","timeout","identity","focus","monitor"] {
+        fixture := CompatibilityFixture(), fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+        plan := CompatibilityPlan(), fixture.Compatibility.MovePlan := plan
+        fixture.WindowSnapshot := fixture.Selected
+        switch interruption {
+            case "input": fixture.Valid := false
+            case "pause": fixture.Owner.Enabled := false
+            case "timeout": fixture.Now += 1000
+            case "identity": fixture.WindowSnapshot.Data.Pid := 202
+            case "focus": fixture.Selected := 0
+            case "monitor": fixture.Intent.Monitor := 3
+        }
+        fixture.Now += 50, fixture.CompatibilityTick()
+        CompatibilityChecks.Assert(!plan.Advances && plan.Cancels=1 && !fixture.Scheduled && !fixture.CompatibilityMoves,
+            "A staged operation stops before another window request after " . interruption)
+    }
+    fixture := CompatibilityFixture(), fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    plan := CompatibilityPlan(), fixture.Compatibility.MovePlan := plan, fixture.WindowSnapshot := fixture.Selected
+    fixture.TakeoverAllowed := false, fixture.Now += 50, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(!plan.Advances && fixture.Requests.Length=1,
+        "Each later stage requires a fresh serial-specific native handoff")
+    fixture := CompatibilityFixture(), fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    plan := CompatibilityPlan(), fixture.Compatibility.MovePlan := plan, fixture.WindowSnapshot := fixture.Selected
+    fixture.ReplaceAtRead := fixture.IntentReads+2, fixture.Now += 50, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(!plan.Advances && plan.Cancels=1 && fixture.Scheduled && fixture.Compatibility.Serial=8,
+        "Replacement during a stage's final snapshot cancels its old plan and preserves the new click")
 
     for excluded in ["Before","Source"] {
         fixture := CompatibilityFixture(false), fixture.Intent.Flags := 32, fixture.Intent.Path := "", fixture.Intent.Id := ""

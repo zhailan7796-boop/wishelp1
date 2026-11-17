@@ -3,8 +3,33 @@
 #NoTrayIcon
 #Include ..\lib\Native.ahk
 #Include ..\lib\UIA.ahk
+#Include ..\lib\NativeEngine.ahk
 
 Log(line) => FileAppend(line . "`n", "*", "UTF-8")
+
+; Only the native click snapshot is supplied by this fixture. Candidate
+; verification, staging, cancellation and confirmation use NativeEngine.
+class ChromeCompatibilityOwner {
+    Enabled := true, BringActive := true, SuccessfulMoves := 0
+    __New() => this.Identity := WindowIdentity("",false)
+    ReportActivity(text) => Log(text)
+    Log(text) => Log(text)
+}
+class ChromeCompatibility extends NativeEngine {
+    __New(hwnd,target,id) {
+        this.Owner := ChromeCompatibilityOwner(), this.Handle := 1, this.Compatibility := 0, this.CompatibilityMoves := 0
+        this.Valid := true, now := Desktop.Tick(), data := this.Owner.Identity.Get(hwnd)
+        this.Intent := {Serial:1,Flags:16,Id:id,Path:data.Path,Monitor:target.Handle,Released:now,Expires:now+8000,
+            NativeClaimed:0,Before:hwnd,Source:0,Candidates:[{Hwnd:hwnd,Pid:data.Pid}]}
+        if !this.BeginCompatibility(1,target.Handle)
+            throw Error("Test compatibility controller did not start")
+    }
+    ReadCompatibilityIntent(serial) => this.Valid && serial=1 ? this.Intent : 0
+    CompatibilityTakeover(serial) => this.Valid && serial=1
+    CancelCompatibilityIntent(serial) => (this.Valid := false,true)
+    CompatibilitySchedule(enabled) {
+    }
+}
 
 FindButton(uia, bar, appId) {
     for button in uia.Buttons(bar) {
@@ -26,6 +51,7 @@ IsTestColor(pixel) => Abs((pixel & 255)-201)<18 && Abs(((pixel>>8) & 255)-87)<18
     && Abs(((pixel>>16) & 255)-49)<18
 
 MovePointer(x,y,&expectedX,&expectedY) {
+    Desktop.Physical()
     if !Desktop.Cursor(&currentX,&currentY) || Abs(currentX-expectedX)>8 || Abs(currentY-expectedY)>8
         throw Error("Other pointer activity detected; expected=" . expectedX . "," . expectedY . "; actual=" . currentX . "," . currentY)
     left := DllCall("user32\GetSystemMetrics","int",76), top := DllCall("user32\GetSystemMetrics","int",77)
@@ -69,30 +95,59 @@ HoverChrome(bar,hwnd,&expectedX,&expectedY) {
 }
 
 ClickChrome(uia, bar, appId, hwnd, &expectedX, &expectedY) {
-    if !Desktop.Cursor(&x,&y) || Abs(x-expectedX)>8 || Abs(y-expectedY)>8
-        throw Error("Other pointer activity detected")
-    button := FindButton(uia, bar, appId)
-    x := (button.Rect.L+button.Rect.R)//2, y := (button.Rect.T+button.Rect.B)//2
-    hit := uia.Hit(x,y)
-    if hit.Kind != "app" || !(hit.Id == appId)
-        throw Error("Test Chrome taskbar button is covered or changed")
-    MovePointer(x,y,&expectedX,&expectedY)
-    if HasArg("--hover") {
-        popup := HoverChrome(bar,hwnd,&expectedX,&expectedY)
-        if Desktop.RootAt(expectedX,expectedY)!=popup
-            throw Error("Test Chrome thumbnail is covered")
+    direct := HasArg("--move-only") || HasArg("--compatibility-only")
+    if !direct {
+        if !Desktop.Cursor(&x,&y) || Abs(x-expectedX)>8 || Abs(y-expectedY)>8
+            throw Error("Other pointer activity detected; expected=" . expectedX . "," . expectedY . "; actual=" . x . "," . y)
+        button := FindButton(uia, bar, appId)
+        x := (button.Rect.L+button.Rect.R)//2, y := (button.Rect.T+button.Rect.B)//2
+        hit := uia.Hit(x,y)
+        if hit.Kind != "app" || !(hit.Id == appId)
+            throw Error("Test Chrome taskbar button is covered or changed")
+        MovePointer(x,y,&expectedX,&expectedY)
+        if HasArg("--hover") {
+            popup := HoverChrome(bar,hwnd,&expectedX,&expectedY)
+            if Desktop.RootAt(expectedX,expectedY)!=popup
+                throw Error("Test Chrome thumbnail is covered")
+        }
+        if !Desktop.Cursor(&x,&y) || Abs(x-expectedX)>8 || Abs(y-expectedY)>8
+            throw Error("Pointer moved before test click")
     }
-    if !Desktop.Cursor(&x,&y) || Abs(x-expectedX)>8 || Abs(y-expectedY)>8
-        throw Error("Pointer moved before test click")
     wasMaximized := WinGetMinMax("ahk_id " . hwnd)=1
-    click := Buffer(80,0)
-    NumPut("uint",2,click,20), NumPut("uint",4,click,60)
-    if DllCall("user32\SendInput","uint",2,"ptr",click,"int",40,"uint")!=2
-        throw Error("Test click failed")
+    Log("Click Chrome; hwnd=" . hwnd . "; foreground=" . Desktop.Foreground() . "; minimized=" . Desktop.IsMin(hwnd)
+        . "; source=" . Desktop.MonitorOf(hwnd).Device . "; target=" . Desktop.MonitorOf(bar).Device)
+    if HasArg("--compatibility-only") {
+        controller := ChromeCompatibility(hwnd,Desktop.MonitorOf(bar),appId)
+    } else if HasArg("--move-only") {
+        ; Exercise the production after-show mover against a foreign renderer
+        ; independently of CBT activation, using only our isolated test Chrome.
+        operation := WindowMoveOperation(hwnd,Desktop.MonitorOf(bar),true)
+        result := operation.Start()
+        Log("Compatibility mover result=" . result)
+        if result != "requested"
+            throw Error("Compatibility mover did not request the test move")
+    } else {
+        click := Buffer(80,0)
+        NumPut("uint",2,click,20), NumPut("uint",4,click,60)
+        if DllCall("user32\SendInput","uint",2,"ptr",click,"int",40,"uint")!=2
+            throw Error("Test click failed")
+    }
     monitor := Desktop.MonitorOf(bar)
-    start := Desktop.Tick(), arrived := 0, whiteMs := 0, rendered := 0
+    start := Desktop.Tick(), arrived := 0, whiteMs := 0, rendered := 0, lastState := ""
     Loop {
         elapsed := Desktop.Tick()-start
+        if IsSet(controller)
+            controller.CompatibilityTick()
+        if IsSet(operation) && operation.Phase != "done" {
+            result := operation.Advance()
+            if result != "waiting" && result != "complete"
+                throw Error("Compatibility operation failed: " . result)
+        }
+        state := Desktop.IsMin(hwnd) . ":" . Desktop.MonitorOf(hwnd).Device . ":" . (Desktop.Foreground()=hwnd)
+        if state != lastState {
+            Log("Chrome state at " . elapsed . "ms=" . state)
+            lastState := state
+        }
         if !Desktop.IsMin(hwnd) && Desktop.Foreground()=hwnd && Desktop.SameMonitor(Desktop.MonitorOf(hwnd),monitor) {
             if !arrived
                 arrived := elapsed+1
@@ -101,7 +156,9 @@ ClickChrome(uia, bar, appId, hwnd, &expectedX, &expectedY) {
                 rendered := elapsed+1
             if !IsTestColor(pixel)
                 rendered := 0
-            if rendered && elapsed-rendered>=200 {
+            if rendered && elapsed-rendered>=1200 {
+                if IsSet(controller) && controller.CompatibilityMoves != 1
+                    throw Error("Production compatibility controller did not confirm the test move")
                 if (WinGetMinMax("ahk_id " . hwnd)=1)!=wasMaximized
                     throw Error("Chrome changed its maximized state")
                 Log("PASS rendered test page on " . monitor.Device . "; maximized=" . wasMaximized . "; arrival-ms=" . (arrived-1)
@@ -111,7 +168,7 @@ ClickChrome(uia, bar, appId, hwnd, &expectedX, &expectedY) {
             if (pixel & 0xFFFFFF) >= 0xE0E0E0
                 whiteMs := elapsed
         }
-        if elapsed>=2200 {
+        if elapsed>=4000 {
             if arrived
                 throw Error(Format("Chrome arrived but page did not render on {}; pixel={:06X}; last-white-ms={}",
                     monitor.Device,pixel,whiteMs))
@@ -129,6 +186,7 @@ HasArg(option) {
     }
     return false
 }
+
 
 if HasArg("--check")
     ExitApp(0)

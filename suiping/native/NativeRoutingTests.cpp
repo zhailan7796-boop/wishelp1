@@ -43,6 +43,89 @@ using CancelFn=void(*)(unsigned);
 using CancelCompatibilityFn=BOOL(*)(unsigned);
 using EnableFn=void(*)(BOOL);
 using StatusFn=BOOL(*)(NativeStatus*,unsigned);
+void CheckPhysicalInput(HMODULE module,HWND candidate,const std::vector<HMONITOR>& monitors) {
+    auto mouse=reinterpret_cast<BOOL(*)(unsigned,int,int)>(GetProcAddress(module,"TF_TestMouseInput"));
+    auto publish=reinterpret_cast<BOOL(*)(const NativeEntry*,unsigned,unsigned)>(GetProcAddress(module,"TF_PublishCache"));
+    auto status=reinterpret_cast<StatusFn>(GetProcAddress(module,"TF_Status"));
+    auto input=reinterpret_cast<BOOL(*)(NativeInputStatus*,unsigned)>(GetProcAddress(module,"TF_InputStatus"));
+    auto cancel=reinterpret_cast<CancelFn>(GetProcAddress(module,"TF_Cancel"));
+    auto intent=reinterpret_cast<IntentFn>(GetProcAddress(module,"TF_CompatibilityIntent"));
+    Check(mouse && publish && status && input && cancel && intent,"physical input regression ABI");
+    WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
+    cls.lpszClassName=L"Shell_SecondaryTrayWnd";
+    Check(RegisterClassW(&cls)!=0,"register owned taskbar hit-test fixture");
+    for (HMONITOR monitor:monitors) {
+        const auto original=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        MONITORINFO info{sizeof(info)};
+        Check(GetMonitorInfoW(monitor,&info)!=FALSE,"physical input monitor geometry");
+        HWND bar=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,cls.lpszClassName,L"",WS_POPUP,
+            info.rcMonitor.left+100,info.rcMonitor.bottom-100,400,80,nullptr,nullptr,cls.hInstance,nullptr);
+        Check(bar!=nullptr,"create owned taskbar fixture on each monitor");
+        struct WindowGuard { HWND hwnd; ~WindowGuard() { DestroyWindow(hwnd); } } ownedBar{bar};
+        ShowWindow(bar,SW_SHOWNOACTIVATE);
+        NativeEntry entry{};
+        entry.taskbar=reinterpret_cast<UINT_PTR>(bar);
+        Check(GetWindowRect(bar,&entry.button)!=FALSE,"read physical taskbar fixture rectangle");
+        entry.count=1; entry.flags=TF_VERIFIED_FOLLOW;
+        entry.windows[0]={reinterpret_cast<UINT_PTR>(candidate),GetCurrentProcessId(),0};
+        GetModuleFileNameW(nullptr,entry.path,1024);
+        wcscpy_s(entry.appId,L"TaskbarFollow.PhysicalInputFixture");
+        const int x=(entry.button.left+entry.button.right)/2,y=(entry.button.top+entry.button.bottom)/2;
+        Check(GetAncestor(WindowFromPoint({x,y}),GA_ROOT)==bar,"physical fixture is the actual hit-test target");
+        SetThreadDpiAwarenessContext(original);
+        for (const auto context : {DPI_AWARENESS_CONTEXT_UNAWARE,DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2}) {
+            const auto previous=SetThreadDpiAwarenessContext(context);
+            Check(previous!=nullptr,"set caller DPI context for input callback");
+            NativeStatus before{},after{};
+            Check(publish(&entry,1,sizeof(entry))!=FALSE,"publish physical fixture button");
+            Check(status(&before,sizeof(before))!=FALSE,"read before callback input status");
+            Check(mouse(WM_LBUTTONDOWN,x,y)!=FALSE,"simulate owned mouse-down callback without sending input");
+            Check(AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(),context)!=FALSE,"mouse-down restores caller DPI context");
+            Check(mouse(WM_LBUTTONUP,x,y)!=FALSE,"simulate owned mouse-up callback without sending input");
+            Check(AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(),context)!=FALSE,"mouse-up restores caller DPI context");
+            Check(status(&after,sizeof(after)) && after.armed==before.armed+1,"physical click arms once from every caller DPI context");
+            NativeInputStatus observation{};
+            Check(input(&observation,sizeof(observation)) && observation.phase==2 && observation.reason==7
+                && observation.awareness==DPI_AWARENESS_PER_MONITOR_AWARE && observation.root==entry.taskbar,
+                "callback hit-test uses per-monitor physical coordinates");
+            MONITORINFOEXW target{}; target.cbSize=sizeof(target);
+            { const auto saved=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                Check(GetMonitorInfoW(monitor,&target)!=FALSE,"read callback target monitor");
+                SetThreadDpiAwarenessContext(saved); }
+            Check(wcscmp(after.target,target.szDevice)==0,"callback preserves the actual clicked monitor");
+            Drain();
+            NativeIntent click{};
+            Check(intent(Messages.serial,&click,sizeof(click))!=FALSE,
+                "after-show controller can read the physical click from every caller DPI context");
+            cancel(0);
+            Check(status(&before,sizeof(before))!=FALSE,"read before drag rejection");
+            Check(mouse(WM_LBUTTONDOWN,x,y) && mouse(WM_LBUTTONUP,x+30,y),"simulate owned taskbar drag");
+            Check(status(&after,sizeof(after)) && before.armed==after.armed,"drag still does not arm positioning");
+            Check(input(&observation,sizeof(observation)) && observation.reason==10,"diagnostics retain why drag was rejected");
+            Check(mouse(WM_LBUTTONDOWN,x,y)!=FALSE,"begin cancellable owned input");
+            cancel(0);
+            Check(mouse(WM_LBUTTONUP,x,y)!=FALSE,"release cancelled owned input");
+            Check(status(&after,sizeof(after)) && before.armed==after.armed,"another input epoch still cancels positioning");
+            Check(input(&observation,sizeof(observation)) && observation.reason==8,"diagnostics retain input cancellation");
+            SetThreadDpiAwarenessContext(previous);
+        }
+        // A foreground window covering the taskbar must continue to prevent a
+        // match, even when its coordinates overlap a valid cached button.
+        const auto saved=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        HWND cover=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,L"TaskbarFollow.RoutingFixture",L"",WS_POPUP,
+            entry.button.left,entry.button.top,400,80,nullptr,nullptr,cls.hInstance,nullptr);
+        Check(cover!=nullptr,"create owned occluding window");
+        WindowGuard ownedCover{cover}; ShowWindow(cover,SW_SHOWNOACTIVATE);
+        SetThreadDpiAwarenessContext(saved);
+        NativeStatus before{},after{};
+        Check(status(&before,sizeof(before))!=FALSE,"read before occluded click");
+        Check(publish(&entry,1,sizeof(entry)) && mouse(WM_LBUTTONDOWN,x,y) && mouse(WM_LBUTTONUP,x,y),"simulate owned occluded click");
+        Check(status(&after,sizeof(after)) && before.armed==after.armed,"occluded taskbar is not treated as clicked");
+        NativeInputStatus observation{};
+        Check(input(&observation,sizeof(observation)) && observation.reason==4,"diagnostics retain rejected physical hits");
+    }
+}
 }
 int wmain(int argc,wchar_t** argv) {
     const HDESK original=GetThreadDesktop(GetCurrentThreadId());
@@ -167,6 +250,7 @@ int wmain(int argc,wchar_t** argv) {
         Check(!release(&entry,target,FALSE),"unverified no-window button remains unsupported");
         wcscpy_s(entry.path,L"C:\\not-the-test-executable.exe"); entry.flags=TF_COLD_START|TF_COMPATIBILITY;
         Check(!release(&entry,target,FALSE),"test route cannot target an unrelated executable");
+        CheckPhysicalInput(module,statusWindow,monitors);
         Check(stop(3000)!=FALSE,"routing controller joins before resource release");
         Check(!intent(Messages.serial,&snapshot,sizeof(snapshot)),"a stopped controller exposes no stale intent");
         printf("PASS %u native explicit-click/self-window/compatibility routing assertions; no input hooks\n",Checks);

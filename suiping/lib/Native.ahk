@@ -624,7 +624,7 @@ class NativeIdentityIndex {
 }
 
 class WindowMover {
-    static Move(hwnd, destination, restoreMinimized := false, refreshVisible := false) {
+    static Move(hwnd, destination, restoreMinimized := false) {
         Desktop.Physical()
         source := Desktop.MonitorOf(hwnd)
         target := Desktop.Monitor(destination.Handle)
@@ -646,22 +646,6 @@ class WindowMover {
         if !IsObject(normal)
             return "rect-failed"
         next := Geometry.Map(normal, source.Work, target.Work)
-        if refreshVisible && !wasMin && DllCall("user32\IsWindowVisible","ptr",hwnd) {
-            ; Queue both operations to the same owning UI thread. A visible
-            ; surface is retired before it is recreated on another display;
-            ; no guessed repaint messages or renderer/application lists.
-            minimized := Buffer(p.Size)
-            DllCall("ntdll\RtlMoveMemory","ptr",minimized,"ptr",p,"uptr",p.Size)
-            NumPut("uint",4,minimized,4)
-            NumPut("uint",7,minimized,8) ; SW_SHOWMINNOACTIVE
-            if !DllCall("user32\SetWindowPlacement","ptr",hwnd,"ptr",minimized)
-                return "minimize-placement-failed:" A_LastError
-            Geometry.ToWorkspace(next,target).Write(p,28)
-            NumPut("uint",4,p,4)
-            NumPut("uint",wasMax ? 3 : 9,p,8)
-            NumPut("int",-1,"int",-1,p,20)
-            return DllCall("user32\SetWindowPlacement","ptr",hwnd,"ptr",p) ? "requested" : "set-placement-failed:" A_LastError
-        }
         ; SetWindowPlacement keeps normal/maximized state and its own coordinate system.
         Geometry.ToWorkspace(next, target).Write(p, 28)
         NumPut("uint", 4, p, 4) ; WPF_ASYNCWINDOWPLACEMENT: do not block on a foreign UI thread
@@ -678,6 +662,87 @@ class WindowMover {
         if !DllCall("user32\SetWindowPlacement", "ptr", hwnd, "ptr", p)
             return "set-placement-failed:" A_LastError
         return "requested"
+    }
+}
+
+; One bounded after-show operation, advanced by its click owner's timer. Foreign
+; SetWindowPlacement calls can report success before the owning UI thread has
+; applied them. Observe each state before submitting the next distinct stage.
+; This object owns no timers: a cancelled click cannot leave a delayed mover.
+class WindowMoveOperation {
+    __New(hwnd,target,restoreMinimized := false) {
+        this.Hwnd := hwnd, this.Pid := Desktop.Pid(hwnd), this.Target := target
+        this.RestoreMinimized := restoreMinimized, this.Phase := "new"
+        this.WasMin := false, this.WasMax := false
+    }
+    Start() {
+        Desktop.Physical()
+        source := Desktop.MonitorOf(this.Hwnd), target := Desktop.Monitor(this.Target.Handle)
+        if !Desktop.Unchanged(target,this.Target) || !IsObject(source)
+            return "monitor-changed"
+        if Desktop.SameMonitor(source,target)
+            return "already-there"
+        placement := Desktop.Placement(this.Hwnd)
+        if !IsObject(placement) || !this.Pid || Desktop.Pid(this.Hwnd) != this.Pid
+            return "placement-failed"
+        this.WasMin := !!Desktop.IsMin(this.Hwnd)
+        if this.WasMin && !this.RestoreMinimized
+            return "minimized"
+        this.WasMax := NumGet(placement,8,"uint")=3 || (this.WasMin && (NumGet(placement,4,"uint") & 2))
+        normal := this.WasMax || this.WasMin
+            ? Geometry.FromWorkspace(ScreenRect.FromBuffer(placement,28),source) : Desktop.Rect(this.Hwnd)
+        if !IsObject(normal)
+            return "rect-failed"
+        this.Placement := placement
+        this.Normal := Geometry.ToWorkspace(Geometry.Map(normal,source.Work,target.Work),target)
+        NumPut("uint",4 | (this.WasMax ? 2 : 0),placement,4)
+        NumPut("int",-1,"int",-1,placement,20)
+        if this.WasMin
+            this.Normal.Write(placement,28)
+        NumPut("uint",7,placement,8) ; SW_SHOWMINNOACTIVE
+        this.Phase := this.WasMin ? "placing" : "minimizing"
+        return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",placement)
+            ? "requested" : "minimize-placement-failed:" A_LastError
+    }
+    Advance() {
+        Desktop.Physical()
+        if this.Phase = "done"
+            return "complete"
+        if this.Phase = "new" || this.Phase = "cancelled"
+            return "cancelled"
+        if Desktop.Pid(this.Hwnd) != this.Pid || !DllCall("user32\IsWindowVisible","ptr",this.Hwnd)
+            return "window-changed"
+        if !Desktop.Unchanged(this.Target,Desktop.Monitor(this.Target.Handle))
+            return "monitor-changed"
+        minimized := Desktop.IsMin(this.Hwnd)
+        if this.Phase = "minimizing" {
+            if !minimized
+                return "waiting"
+            this.Normal.Write(this.Placement,28)
+            this.Phase := "placing"
+            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
+                ? "waiting" : "target-placement-failed:" A_LastError
+        }
+        if this.Phase = "placing" {
+            if !minimized || !Desktop.SameMonitor(Desktop.MonitorOf(this.Hwnd),this.Target)
+                return "waiting"
+            NumPut("uint",this.WasMax ? 3 : 9,this.Placement,8)
+            this.Phase := "restoring"
+            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
+                ? "waiting" : "restore-placement-failed:" A_LastError
+        }
+        if minimized || !Desktop.SameMonitor(Desktop.MonitorOf(this.Hwnd),this.Target)
+            return "waiting"
+        placement := Desktop.Placement(this.Hwnd)
+        if !IsObject(placement) || (NumGet(placement,8,"uint")=3) != !!this.WasMax
+            return "waiting"
+        this.Phase := "done"
+        return "complete"
+    }
+    Cancel() {
+        ; A new input owns the user's focus and display state. Never restore,
+        ; activate, or submit more geometry after this operation is cancelled.
+        this.Phase := "cancelled"
     }
 }
 

@@ -9,20 +9,26 @@ Desktop.Physical()
 DetectHiddenWindows(true)
 Log(line) => FileAppend(line . "`n", "*", "UTF-8")
 class Acceptance {
-    static Uia := 0, Pointer := false, X := 0, Y := 0, Focus := 0
+    static Uia := 0, Pointer := false, X := 0, Y := 0, Focus := 0, InputChanged := false
     static CheckPointer() {
-        if this.Pointer && (!Desktop.Cursor(&x,&y) || Abs(x-this.X)>8 || Abs(y-this.Y)>8)
-            throw Error("Other pointer input detected; stopped test")
+        if this.Pointer && (!Desktop.Cursor(&x,&y) || Abs(x-this.X)>8 || Abs(y-this.Y)>8) {
+            this.InputChanged := true
+            throw Error("Pointer changed; stopped test; expected=" . this.X . "," . this.Y . "; actual=" . x . "," . y)
+        }
     }
     static Click(x,y) {
         this.CheckPointer()
         if !DllCall("user32\SetPhysicalCursorPos","int",x,"int",y)
             throw Error("Cannot position test pointer")
         this.X := x, this.Y := y, this.Pointer := true
-        SendLevel(1)
-        SendEvent("{LButton down}")
+        input := Buffer(40,0)
+        NumPut("uint",2,input,20)
+        if DllCall("user32\SendInput","uint",1,"ptr",input,"int",40,"uint")!=1
+            throw Error("Test mouse down failed")
         Sleep(60)
-        SendEvent("{LButton up}")
+        NumPut("uint",4,input,20)
+        if DllCall("user32\SendInput","uint",1,"ptr",input,"int",40,"uint")!=1
+            throw Error("Test mouse up failed")
     }
     static Button(bar,id) {
         for item in this.Uia.Buttons(bar) {
@@ -107,10 +113,10 @@ if testCase="--check" {
     Log("PASS manual acceptance script parse; no window or input operations")
     ExitApp(0)
 }
-if A_Args.Length>1 || (testCase!="status" && testCase!="explorer" && testCase!="video")
+if A_Args.Length>1 || (testCase!="status" && testCase!="explorer" && testCase!="video" && testCase!="feishu")
     ExitApp(2)
 originalCursor := Desktop.Cursor(&originalX,&originalY)
-status := 0, folder := 0, video := 0, videoPlacement := 0, code := 0
+status := 0, folder := 0, video := 0, videoPlacement := 0, existing := 0, existingPid := 0, existingPlacement := 0, code := 0
 try {
     if !originalCursor
         throw Error("Actual input desktop unavailable")
@@ -122,6 +128,21 @@ try {
     Acceptance.Focus := Gui("+ToolWindow","随屏临时验收")
     Acceptance.Focus.AddText(,"正在测试任务栏跨屏恢复，稍后自动关闭。")
     Acceptance.Focus.Show("x" . (first.Work.L+80) . " y" . (first.Work.T+80) . " w360 h100")
+
+    if testCase="feishu" {
+    ids := WindowIdentity(root . "\settings.ini"), appId := "com.electron.Feishu"
+    for hwnd in WinGetList("ahk_exe Feishu.exe") {
+        if Desktop.Eligible(hwnd) && ids.Match(appId,ids.Get(hwnd)) {
+            if existing
+                throw Error("Multiple eligible Feishu windows; no automatic selection")
+            existing := hwnd, existingPid := Desktop.Pid(hwnd), existingPlacement := Desktop.Placement(hwnd)
+        }
+    }
+    if !existing || !IsObject(existingPlacement)
+        throw Error("No uniquely verified Feishu window available for reversible restore checks")
+    Acceptance.Restore(existing,appId,first,secondary,"Feishu 1->2")
+    Acceptance.Restore(existing,appId,second,primary,"Feishu 2->1")
+    }
 
     if testCase="status" {
     Run('"' . root . '\Start.exe"',root)
@@ -180,7 +201,9 @@ try {
         }
     }
     if !video {
-        b := Acceptance.Button(primary,ids.NativePath(videoId))
+        try b := Acceptance.Button(primary,videoId)
+        catch
+            b := Acceptance.Button(primary,ids.NativePath(videoId))
         x := (b.Rect.L+b.Rect.R)//2, y := (b.Rect.T+b.Rect.B)//2
         h := Acceptance.Uia.Hit(x,y)
         if h.Kind!="app" || h.Id!=b.Id
@@ -212,6 +235,8 @@ try {
     Log("FAIL " . e.Message . "; line=" . e.Line)
     code := 1
 } finally {
+    if existing && Desktop.Pid(existing)=existingPid && IsObject(existingPlacement)
+        DllCall("user32\SetWindowPlacement","ptr",existing,"ptr",existingPlacement)
     if folder && DllCall("user32\IsWindow","ptr",folder)
         try WinClose("ahk_id " . folder)
     if video && DllCall("user32\IsWindow","ptr",video) {
@@ -224,10 +249,10 @@ try {
         DllCall("user32\ShowWindow","ptr",status,"int",0)
     if IsObject(Acceptance.Focus)
         Acceptance.Focus.Destroy()
-    if originalCursor
+    if originalCursor && !Acceptance.InputChanged
         DllCall("user32\SetPhysicalCursorPos","int",originalX,"int",originalY)
-    if originalForeground
+    if originalForeground && !Acceptance.InputChanged
         try WinActivate("ahk_id " . originalForeground)
-    Log("cleanup complete; pointer and original focus restored")
+    Log("cleanup complete; input-changed=" . Acceptance.InputChanged)
 }
 ExitApp(code)

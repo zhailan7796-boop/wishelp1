@@ -3,7 +3,7 @@
 class NativeEngine {
     static PackagedFollowFlag := 8, VerifiedFollowFlag := 16, ShellLaunchFlag := 32, AfterShowFlags := 4 | 8 | 16 | 32
     static Exports() => ["Start", "StopAndWait", "Configure", "SetEnabled", "Cancel", "PublishCache", "Status",
-        "SetPeekEnabled", "ShowPeek", "HidePeek", "HoverCandidates", "AccessibleName", "CompatibilityIntent", "CancelCompatibility", "IntentBytes", "BeginFallback"]
+        "SetPeekEnabled", "ShowPeek", "HidePeek", "HoverCandidates", "AccessibleName", "CompatibilityIntent", "CancelCompatibility", "IntentBytes", "BeginFallback", "InputStatus"]
     static DllPath() {
         dllName := IniRead(A_ScriptDir . "\native\bin\runtime.ini", "Native", "Dll")
         if !RegExMatch(dllName, "^NativeHooks-[a-f0-9]+-x64\.dll$")
@@ -162,7 +162,7 @@ class NativeEngine {
             shell := !!(fresh.Flags & NativeEngine.ShellLaunchFlag), verified := !!(fresh.Flags & NativeEngine.VerifiedFollowFlag)
             label := shell ? "打开窗口随屏" : (verified ? "窗口补充定位" : (packaged ? "应用包窗口补充定位" : "32位兼容定位"))
             this.Compatibility := {Serial:serial,Target:target,Expires:fresh.Expires,Hwnd:0,Pid:0,Since:0,
-                Requested:false,RequestedAt:0,Recovering:false,Label:label,
+                Requested:false,RequestedAt:0,Recovering:false,MovePlan:0,Label:label,
                 LogLabel:shell ? "shell launch" : (verified ? "verified follow" : (packaged ? "packaged follow" : "32-bit compatibility"))}
             this.CompatibilitySchedule(true)
         } finally Critical(previousCritical ? previousCritical : "Off")
@@ -211,14 +211,19 @@ class NativeEngine {
         window.Recovery := true
         return window
     }
-    CompatibilityMove(hwnd,target) => (Desktop.Foreground() = hwnd || this.Compatibility.Recovering)
-        && Desktop.Pid(hwnd) = this.Compatibility.Pid
-        ? WindowMover.Move(hwnd,target,this.Compatibility.Recovering,true) : "focus-changed"
+    CompatibilityMove(hwnd,target) {
+        state := this.Compatibility
+        if (Desktop.Foreground() != hwnd && !state.Recovering) || Desktop.Pid(hwnd) != state.Pid
+            return "focus-changed"
+        state.MovePlan := WindowMoveOperation(hwnd,target,state.Recovering)
+        return state.MovePlan.Start()
+    }
+    CompatibilityAdvanceMove(state) => state.MovePlan.Advance()
     static CompatibilityDelay(intent) => (intent.Flags & (NativeEngine.PackagedFollowFlag | NativeEngine.VerifiedFollowFlag)) && intent.NativeClaimed ? 500 : 80
-    CompatibilityMatches(intent,window) {
+    CompatibilityMatches(intent,window,ownTransition := false) {
         if !IsObject(window) || !window.Hwnd || !window.Data.Pid || !window.Visible || !window.Eligible
             return false
-        if window.Minimized && !(window.HasOwnProp("Recovery") && window.Recovery
+        if window.Minimized && !ownTransition && !(window.HasOwnProp("Recovery") && window.Recovery
             && (intent.Flags & NativeEngine.VerifiedFollowFlag) && window.Hwnd = intent.Before)
             return false
         if intent.Flags & NativeEngine.ShellLaunchFlag
@@ -251,8 +256,11 @@ class NativeEngine {
     StopCompatibility(expected := 0) {
         if IsObject(expected) && this.Compatibility != expected
             return false
+        state := this.Compatibility
         this.CompatibilitySchedule(false)
         this.Compatibility := 0
+        if IsObject(state) && IsObject(state.MovePlan)
+            state.MovePlan.Cancel()
         return true
     }
     EndCompatibility(state,text := "",success := false) {
@@ -308,6 +316,43 @@ class NativeEngine {
             if !Desktop.Unchanged(state.Target,this.CompatibilityMonitor(intent.Monitor)) {
                 this.EndCompatibility(state)
                 return
+            }
+            if state.Requested && IsObject(state.MovePlan) {
+                window := this.CompatibilitySnapshot(state.Hwnd)
+                if !this.CompatibilityMatches(intent,window,true) || window.Data.Pid != state.Pid {
+                    this.EndCompatibility(state,state.Label . "已结束，所选窗口已发生变化。")
+                    return
+                }
+                if !window.Minimized && !state.Recovering {
+                    foreground := this.CompatibilityForeground()
+                    if !IsObject(foreground) || foreground.Hwnd != state.Hwnd {
+                        this.EndCompatibility(state,state.Label . "已结束，所选窗口已切换焦点。")
+                        return
+                    }
+                }
+                if now-state.RequestedAt >= 1000 {
+                    this.EndCompatibility(state,state.Label . "未能确认目标位置，已停止继续尝试。")
+                    return
+                }
+                previousCritical := A_IsCritical
+                Critical("On")
+                try {
+                    if !this.CompatibilityCurrent(state)
+                        return
+                    fresh := this.ReadCompatibilityIntent(state.Serial)
+                    if !this.CompatibilityCurrent(state) || !IsObject(fresh) || fresh.Serial != state.Serial
+                        || fresh.Monitor != state.Target.Handle || !(fresh.Flags & NativeEngine.AfterShowFlags)
+                        || this.CompatibilityNow() >= fresh.Expires
+                        || !this.CompatibilityMatches(fresh,window,true) || !this.CompatibilityTakeover(fresh.Serial)
+                        return
+                    result := this.CompatibilityAdvanceMove(state)
+                } finally Critical(previousCritical ? previousCritical : "Off")
+                if result = "waiting"
+                    return
+                if result != "complete" {
+                    this.EndCompatibility(state,state.Label . "请求未完成。")
+                    return
+                }
             }
             window := this.CompatibilityForeground()
             if !this.CompatibilityMatches(intent,window) {
@@ -382,7 +427,10 @@ class NativeEngine {
                 return
             }
             this.Owner.Log(state.LogLabel . " requested; id=" . fresh.Id . "; pid=" . state.Pid
-                . "; hwnd=" . state.Hwnd . "; target=" . state.Target.Device)
+                . "; hwnd=" . state.Hwnd . "; target=" . state.Target.Device . "; recovering=" . state.Recovering
+                . "; native-claimed=" . fresh.NativeClaimed . "; before=" . fresh.Before
+                . "; since-release-ms=" . (now-fresh.Released) . "; source=" . selected.Monitor.Device
+                . "; minimized=" . selected.Minimized)
         } catch as e {
             this.StopCompatibility(state)
             try this.Owner.Log(state.LogLabel . " error: " . e.Message . "; line=" . e.Line)
@@ -544,6 +592,7 @@ class NativeEngine {
                 |(verifiedFollow?NativeEngine.VerifiedFollowFlag:0)}
     }
     Poll() {
+        this.PollInput()
         status := Buffer(168,0)
         if !DllCall(this.StatusFn,"ptr",status,"uint",status.Size,"int")
             return
@@ -578,6 +627,23 @@ class NativeEngine {
             this.Owner.ReportActivity(state.Label . "正在等待所选窗口显示。")
         else if messages.Has(kind)
             this.Owner.ReportActivity(messages[kind])
+    }
+    PollInput() {
+        snapshot := Buffer(704,0)
+        if !DllCall(this.InputStatusFn,"ptr",snapshot,"uint",snapshot.Size,"int")
+            return
+        number := NumGet(snapshot,0,"uint64")
+        if !number || (this.HasOwnProp("InputNumber") && number = this.InputNumber)
+            return
+        this.InputNumber := number
+        static reasons := Map(1,"pressed",2,"modifier",3,"cooldown",4,"hit-rejected",7,"released",8,"input-cancelled",9,"hold-rejected",10,"drag-rejected")
+        reason := NumGet(snapshot,36,"uint")
+        this.Owner.Log("native input=" . (reasons.Has(reason) ? reasons[reason] : reason)
+            . "; point=" . NumGet(snapshot,8,"int") . "," . NumGet(snapshot,12,"int")
+            . "; root=" . NumGet(snapshot,16,"uint64") . "; class=" . StrGet(snapshot.Ptr+64,64)
+            . "; dpi-awareness=" . NumGet(snapshot,40,"uint") . "; cache-age-ms=" . NumGet(snapshot,24,"uint64")
+            . "; candidates=" . NumGet(snapshot,48,"uint") . "; delta=" . NumGet(snapshot,52,"int") . "," . NumGet(snapshot,56,"int")
+            . "; id=" . StrGet(snapshot.Ptr+192,256))
     }
 }
 TaskbarUIAField(text) => SubStr(StrReplace(StrReplace(text,"`n"," "),"`r"," "),1,1024)

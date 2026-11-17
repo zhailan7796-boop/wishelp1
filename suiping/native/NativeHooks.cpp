@@ -80,6 +80,14 @@ bool ClassIs(HWND hwnd, const wchar_t* name) {
 }
 bool ShellBar(HWND hwnd) { return ClassIs(hwnd,L"Shell_TrayWnd") || ClassIs(hwnd,L"Shell_SecondaryTrayWnd"); }
 bool Preview(HWND hwnd) { return ClassIs(hwnd,L"TaskListThumbnailWnd"); }
+struct DpiContext {
+    DPI_AWARENESS_CONTEXT previous;
+    explicit DpiContext(DPI_AWARENESS_CONTEXT context):previous(SetThreadDpiAwarenessContext(context)) {}
+    ~DpiContext() { if (previous) SetThreadDpiAwarenessContext(previous); }
+};
+struct PhysicalDpi: DpiContext {
+    PhysicalDpi():DpiContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {}
+};
 void MappingName(wchar_t* name, size_t length) {
     wchar_t path[2048]{}, desktop[256]{}; DWORD needed{};
     GetModuleFileNameW(Module, path, 2048);
@@ -143,6 +151,7 @@ bool CancelTransaction(Shared* shared,const Transaction& tx) {
         static_cast<LONG>(tx.epoch))==static_cast<LONG>(tx.epoch);
 }
 bool Snapshot(Shared* shared, Transaction& tx,bool allowExpired=false) {
+    PhysicalDpi physical;
     if (!Live(shared) || Now() < static_cast<std::uint64_t>(Read64(shared->coolUntil))) return false;
     LONG sequence=Read32(shared->txSequence);
     if (sequence&1) return false;
@@ -330,16 +339,23 @@ void VerifyPlacement(Shared* shared,HWND hwnd,Placement* placement) {
     RemovePlacement(hwnd,placement);
 }
 LRESULT CALLBACK PlacementProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR reference) {
+    PhysicalDpi physical;
+    const auto next=[&] {
+        // Preserve the application's own DPI contract while calling its window
+        // procedure; only our geometry calculations use physical coordinates.
+        DpiContext application(physical.previous);
+        return DefSubclassProc(hwnd,message,wparam,lparam);
+    };
     auto* placement=reinterpret_cast<Placement*>(reference);
     PlacementCall call(placement);
     Shared* shared=GetShared();
     if (message==WM_NCDESTROY) {
-        const LRESULT result=DefSubclassProc(hwnd,message,wparam,lparam);
+        const LRESULT result=next();
         RemovePlacement(hwnd,placement); return result;
     }
     if (!StillCurrent(shared,placement->tx)) {
         RemovePlacement(hwnd,placement);
-        return DefSubclassProc(hwnd,message,wparam,lparam);
+        return next();
     }
     if (message==WM_TIMER && wparam==SubclassId) {
         if (placement->calls==1 && !Reentry) VerifyPlacement(shared,hwnd,placement);
@@ -355,7 +371,7 @@ LRESULT CALLBACK PlacementProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lpara
         }
         return 0;
     }
-    const LRESULT result=DefSubclassProc(hwnd,message,wparam,lparam);
+    const LRESULT result=next();
     // Application handlers can pump messages or synchronously ask the
     // controller to cancel/rearm. Never apply old geometry, claim identity,
     // or cancel a newer input epoch after returning from that application.
@@ -519,12 +535,12 @@ bool ColdExistingMatches(const Transaction& tx,HWND hwnd) {
     return _wcsicmp(path,tx.entry.path)==0
         && (!(tx.entry.flags&TF_REQUIRE_APP_ID) || ExactWindowIdentity(hwnd,tx.entry.appId));
 }
-LRESULT CALLBACK Cbt(int code,WPARAM wparam,LPARAM lparam) {
-    if (code<0 || Reentry) return CallNextHookEx(nullptr,code,wparam,lparam);
+bool ProcessCbt(int code,WPARAM wparam,LPARAM lparam) {
+    if (code<0 || Reentry) return false;
     Shared* shared=GetShared(); Transaction tx;
-    if (!Snapshot(shared,tx)) return CallNextHookEx(nullptr,code,wparam,lparam);
-    if (FallbackOwns(shared,tx)) return CallNextHookEx(nullptr,code,wparam,lparam);
-    if (tx.entry.flags&TF_COMPATIBILITY) return CallNextHookEx(nullptr,code,wparam,lparam);
+    if (!Snapshot(shared,tx)) return false;
+    if (FallbackOwns(shared,tx)) return false;
+    if (tx.entry.flags&TF_COMPATIBILITY) return false;
     HWND hwnd=reinterpret_cast<HWND>(wparam);
     if (code==HCBT_DESTROYWND && ((tx.preview && Candidate(tx,hwnd))
         || Read64(shared->claim)==(static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32)|static_cast<unsigned>(reinterpret_cast<UINT_PTR>(hwnd))))) {
@@ -563,10 +579,16 @@ LRESULT CALLBACK Cbt(int code,WPARAM wparam,LPARAM lparam) {
             if (!GetWindowSubclass(hwnd,PlacementProc,SubclassId,&placement)) PositionVisible(shared,hwnd,tx);
         }
     }
-    return CallNextHookEx(nullptr,code,wparam,lparam);
+    return false;
+}
+LRESULT CALLBACK Cbt(int code,WPARAM wparam,LPARAM lparam) {
+    bool handled{};
+    { PhysicalDpi physical; handled=ProcessCbt(code,wparam,lparam); }
+    return handled ? 1 : CallNextHookEx(nullptr,code,wparam,lparam);
 }
 LRESULT CALLBACK ObserveMessages(int code,WPARAM wparam,LPARAM lparam) {
     if (code>=0) {
+        PhysicalDpi physical;
         const auto* message=reinterpret_cast<const CWPSTRUCT*>(lparam);
         if (message->message==WM_SHOWWINDOW && message->wParam) {
             Shared* shared=GetShared(); Transaction tx;
@@ -604,6 +626,7 @@ bool CacheHit(Shared* shared,POINT point,HWND root,NativeEntry& entry) {
     return false;
 }
 void Arm(Shared* shared,const NativeEntry& entry,HMONITOR monitor,HWND before,bool preview,HWND source=nullptr) {
+    PhysicalDpi physical;
     Transaction tx{}; tx.entry=entry; tx.monitor=Id(monitor); tx.before=Id(before); tx.source=Id(source);
     tx.target.cbSize=sizeof(tx.target);
     if (!GetMonitorInfoW(monitor,&tx.target)) return;
@@ -624,7 +647,24 @@ struct ClickState {
     unsigned epoch{};
 };
 ClickState Click;
+NativeInputStatus InputStatus{};
+volatile LONG InputStatusSequence{};
 SRWLOCK ClickLock=SRWLOCK_INIT;
+void TraceInput(Shared* shared,POINT point,HWND root,const NativeEntry& entry,unsigned reason,unsigned phase=1) {
+    InterlockedIncrement(&InputStatusSequence);
+    ++InputStatus.number;
+    InputStatus.point=point; InputStatus.root=Id(root);
+    InputStatus.cacheAge=Now()-static_cast<std::uint64_t>(Read64(shared->cacheAt));
+    InputStatus.phase=phase; InputStatus.reason=reason;
+    InputStatus.awareness=static_cast<unsigned>(GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()));
+    InputStatus.cacheSequence=static_cast<unsigned>(Read32(shared->cacheSequence));
+    InputStatus.count=entry.count;
+    InputStatus.dx=phase==2 ? point.x-Click.down.x : 0;
+    InputStatus.dy=phase==2 ? point.y-Click.down.y : 0;
+    GetClassNameW(root,InputStatus.rootClass,64);
+    wcsncpy_s(InputStatus.appId,entry.appId,_TRUNCATE);
+    MemoryBarrier(); InterlockedIncrement(&InputStatusSequence);
+}
 void SetHoverEntry(const NativeEntry& entry) {
     AcquireSRWLockExclusive(&ClickLock); Click.entry=entry; ReleaseSRWLockExclusive(&ClickLock);
 }
@@ -702,6 +742,12 @@ bool Modified() {
 LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
     Shared* shared=Controller.data;
     if (code<0 || !Live(shared)) return CallNextHookEx(nullptr,code,message,pointer);
+    {
+    // Windows invokes low-level hooks using a DPI context associated with the
+    // callback, which need not match the worker's startup context. MSLLHOOKSTRUCT
+    // points and the UIA cache are physical: establish that context on every
+    // callback, and restore it before passing input to the next hook.
+    PhysicalDpi physical;
     const auto& input=*reinterpret_cast<MSLLHOOKSTRUCT*>(pointer);
     if (message==WM_MOUSEMOVE) {
         HWND root=GetAncestor(WindowFromPoint(input.pt),GA_ROOT);
@@ -735,8 +781,32 @@ LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
             Click.source=root; Click.preview=false; Click.shell=true; Click.valid=true;
             Click.epoch=static_cast<unsigned>(Read32(shared->inputEpoch));
         }
+        // Keep a bounded snapshot for taskbar-area input, including a rejected
+        // hit. No window titles, key values, file I/O or UIA in this callback.
+        NativeEntry nearby{};
+        bool nearButton=false;
+        const LONG sequence=Read32(shared->cacheSequence),index=Read32(shared->cacheIndex);
+        if (!(sequence&1)) {
+            for (unsigned i=0;i<shared->count[index];++i) {
+                if (PtInRect(&shared->entries[index][i].button,input.pt)) {
+                    nearby=shared->entries[index][i]; nearButton=true; break;
+                }
+            }
+            MemoryBarrier();
+            if (sequence!=Read32(shared->cacheSequence)) nearButton=false;
+        }
+        if (ShellBar(root) || isPreview || nearButton)
+            TraceInput(shared,input.pt,root,Click.valid ? Click.entry : nearby,
+                Click.valid ? 1u : (Modified()?2u:(Now()<static_cast<std::uint64_t>(Read64(shared->coolUntil))?3u:4u)));
     } else if (message==WM_LBUTTONUP && Click.valid) {
         Click.valid=false;
+        const bool validEpoch=Click.epoch==static_cast<unsigned>(Read32(shared->inputEpoch));
+        const bool validTime=Now()-Click.downAt<=1500;
+        const bool validDrag=abs(input.pt.x-Click.down.x)<=std::max(4,GetSystemMetrics(SM_CXDRAG))
+            && abs(input.pt.y-Click.down.y)<=std::max(4,GetSystemMetrics(SM_CYDRAG));
+        if (!Click.shell)
+            TraceInput(shared,input.pt,GetAncestor(WindowFromPoint(input.pt),GA_ROOT),Click.entry,
+                Modified()?2u:(!validEpoch?8u:(!validTime?9u:(!validDrag?10u:7u))),2);
         if (!Modified() && Click.epoch==static_cast<unsigned>(Read32(shared->inputEpoch)) && Now()-Click.downAt<=1500
             && abs(input.pt.x-Click.down.x)<=std::max(4,GetSystemMetrics(SM_CXDRAG))
             && abs(input.pt.y-Click.down.y)<=std::max(4,GetSystemMetrics(SM_CYDRAG))) {
@@ -751,6 +821,7 @@ LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
         QueuePeekHide();
         Click.valid=false; Click.hoverAt=0; Cancel(shared);
         if (hadPrevious) { InterlockedIncrement64(&shared->cancelled); Event(shared,TF_CANCEL,nullptr,&previous); }
+    }
     }
     return CallNextHookEx(nullptr,code,message,pointer);
 }
@@ -819,6 +890,7 @@ DWORD RunInputThread() {
     SetTimer(nullptr,1,200,nullptr); SetEvent(WorkerReady);
     while (!Read32(StopRequested) && GetMessageW(&message,nullptr,0,0)>0) {
         if (Read32(StopRequested)) break;
+        PhysicalDpi physical;
         InterlockedExchange64(&Controller.data->heartbeat,static_cast<LONG64>(Now()));
         if (message.message==WM_TIMER) {
             POINT point{}; GetPhysicalCursorPos(&point);
@@ -1050,6 +1122,14 @@ BOOL TF_Status(NativeStatus* status,unsigned bytes) {
     status->lastWindow=Read64(shared->lastWindow); status->latency=Read64(shared->latency); status->eventNumber=Read64(shared->eventNumber);
     wcsncpy_s(status->target,shared->target,_TRUNCATE); return TRUE;
 }
+BOOL TF_InputStatus(NativeInputStatus* status,unsigned bytes) {
+    if (!Controller.data || !status || bytes!=sizeof(*status)) return FALSE;
+    const LONG sequence=Read32(InputStatusSequence);
+    if (sequence&1) return FALSE;
+    *status=InputStatus;
+    MemoryBarrier();
+    return sequence==Read32(InputStatusSequence);
+}
 unsigned TF_IntentBytes() { return sizeof(NativeIntent); }
 BOOL TF_BeginFallback(unsigned serial) {
     if (!Controller.data) return FALSE;
@@ -1111,6 +1191,17 @@ BOOL TF_TestShellLaunch(HWND source,HMONITOR target) {
         || !IsWindow(source) || !GetMonitorInfoW(target,&info) || !Live(Controller.data)) return FALSE;
     return ReleaseShellLaunch(Controller.data,target,source,source)?TRUE:FALSE;
 }
+BOOL TF_TestMouseInput(unsigned message,int x,int y) {
+    if (!Controller.data || !(StartFlags&TF_TEST_MODE)
+        || (message!=WM_LBUTTONDOWN && message!=WM_LBUTTONUP)) return FALSE;
+    HWND root{};
+    { PhysicalDpi physical; root=GetAncestor(WindowFromPoint({x,y}),GA_ROOT); }
+    DWORD pid{}; GetWindowThreadProcessId(root,&pid);
+    if (!root || pid!=GetCurrentProcessId()) return FALSE;
+    MSLLHOOKSTRUCT input{}; input.pt={x,y};
+    Mouse(HC_ACTION,message,reinterpret_cast<LPARAM>(&input));
+    return TRUE;
+}
 BOOL TF_TestArmIdentity(const wchar_t* path,const wchar_t* appId,HMONITOR target) {
     if (!TF_TestArm(path,nullptr,target) || !appId || wcslen(appId)>=256) return FALSE;
     NativeEntry entry{}; wcsncpy_s(entry.path,path,_TRUNCATE); wcsncpy_s(entry.appId,appId,_TRUNCATE);
@@ -1137,6 +1228,7 @@ HWND TF_TestPeek(HWND source,HWND popup,HMONITOR target,BOOL show) {
 }
 unsigned TF_HoverCandidates(NativeCandidate* candidates,unsigned capacity) {
     if (!Controller.data || !candidates || capacity<TF_MAX_WINDOWS || !Live(Controller.data)) return 0;
+    PhysicalDpi physical;
     auto* shared=Controller.data;
     if (Now()-static_cast<std::uint64_t>(Read64(shared->cacheAt))>3000) return 0;
     POINT point{}; if (!GetPhysicalCursorPos(&point) || !Preview(GetAncestor(WindowFromPoint(point),GA_ROOT))) return 0;
@@ -1163,6 +1255,7 @@ unsigned TF_HoverCandidates(NativeCandidate* candidates,unsigned capacity) {
 }
 BOOL TF_AccessibleName(int x,int y,wchar_t* name,unsigned capacity) {
     if (!name || capacity<2 || capacity>32768) return FALSE;
+    PhysicalDpi physical;
     name[0]=0;
     IAccessible* accessible{}; VARIANT child{}; BSTR text{};
     if (FAILED(AccessibleObjectFromPoint({x,y},&accessible,&child)) || !accessible) return FALSE;
