@@ -16,7 +16,7 @@ using CancelFn=void(*)(unsigned);
 using ConfigureFn=void(*)(unsigned,BOOL);
 CancelFn Cancel;
 ConfigureFn Configure;
-using IdentityArmFn=BOOL(*)(const wchar_t*,const wchar_t*,HMONITOR);
+using IdentityArmFn=BOOL(*)(const wchar_t*,const wchar_t*,HMONITOR,BOOL);
 using TestPeekFn=HWND(*)(HWND,HWND,HMONITOR,BOOL);
 IdentityArmFn ArmIdentity;
 TestPeekFn TestPeek;
@@ -242,19 +242,21 @@ int wmain(int argc,wchar_t** argv) {
         }
         const wchar_t* exact=L"TaskbarFollow.Pwa.Exact";
         const wchar_t* other=L"TaskbarFollow.Pwa.Other";
-        struct IdentityCase { const wchar_t* windowId; const wchar_t* processId; bool moves; const char* label; };
+        struct IdentityCase { const wchar_t* windowId; const wchar_t* processId; bool moves; const char* label; bool jumpList{}; };
         const IdentityCase identityCases[]={
             {exact,nullptr,true,"exact window AppID assigned after creation"},
             {other,nullptr,false,"different window AppID stays untouched"},
             {nullptr,exact,true,"process-only desktop AppID (Tauri/CCSwitch route)"},
             {nullptr,other,false,"different process-only desktop AppID stays untouched"},
             {other,exact,false,"window AppID mismatch overrides matching process AppID"},
-            {exact,other,true,"matching window AppID overrides mismatching process AppID"}
+            {exact,other,true,"matching window AppID overrides mismatching process AppID"},
+            {exact,nullptr,true,"cold jump-list launch with exact AppID",true},
+            {other,nullptr,false,"cold jump-list launch rejects a foreign AppID",true}
         };
         unsigned scenario=0;
         for (const auto& identity:identityCases) {
             Cancel(0); Child child;
-            Check(ArmIdentity(Executable().c_str(),exact,target)!=FALSE,"identity arm failed");
+            Check(ArmIdentity(Executable().c_str(),exact,target,identity.jumpList)!=FALSE,"identity arm failed");
             Spawn(child,L"Local\\TaskbarFollow.IdentityTest."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(scenario++),
                 0,source,identity.moves?target:monitors[0],false,false,identity.windowId,identity.processId);
             Wait([&] { return child.state->paints>0; });

@@ -44,6 +44,7 @@ class Desktop {
         return StrGet(b)
     }
     static Foreground() => DllCall("user32\GetForegroundWindow", "ptr")
+    static Owner(hwnd) => DllCall("user32\GetWindow", "ptr", hwnd, "uint", 4, "ptr")
     static IsMin(hwnd) => DllCall("user32\IsIconic", "ptr", hwnd)
     static Pid(hwnd) {
         pid := 0
@@ -96,7 +97,7 @@ class Desktop {
         return !hwnd || this.IsTaskbar(c) || this.IsThumbnail(c)
             || c = "Progman" || c = "WorkerW" || c = "Windows.UI.Core.CoreWindow"
     }
-    static Eligible(hwnd) {
+    static Eligible(hwnd, launchSource := 0) {
         if !hwnd || !DllCall("user32\IsWindow", "ptr", hwnd) || this.IsShell(hwnd)
             return false
         if !DllCall("user32\IsWindowVisible", "ptr", hwnd) || !DllCall("user32\IsWindowEnabled", "ptr", hwnd)
@@ -105,8 +106,9 @@ class Desktop {
         style := DllCall("user32\GetWindowLongPtrW", "ptr", hwnd, "int", -16, "ptr")
         if (ex & 0x08000080) || (style & 0x40000000) ; NOACTIVATE, TOOLWINDOW, CHILD
             return false
-        if DllCall("user32\GetWindow", "ptr", hwnd, "uint", 4, "ptr") && !(ex & 0x40000)
-            return false ; owned dialogs are not independent taskbar windows
+        owner := this.Owner(hwnd)
+        if owner && owner != launchSource && !(ex & 0x40000)
+            return false ; allow a newly shown dialog directly owned by the clicked window
         monitor := this.MonitorOf(hwnd), rect := this.Rect(hwnd)
         if IsObject(monitor) && IsObject(rect) && !(style & 0x00C00000)
             && rect.L <= monitor.Bounds.L && rect.T <= monitor.Bounds.T

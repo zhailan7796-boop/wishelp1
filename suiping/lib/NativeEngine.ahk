@@ -1,9 +1,11 @@
 ; Native hooks own input capture and before-show positioning for 64-bit apps.
 ; Every verified taskbar click also has a bounded, identity-checked backup.
 class NativeEngine {
-    static PackagedFollowFlag := 8, VerifiedFollowFlag := 16, ShellLaunchFlag := 32, AfterShowFlags := 4 | 8 | 16 | 32
+    static PackagedFollowFlag := 8, VerifiedFollowFlag := 16, ShellLaunchFlag := 32, JumpListFlag := 64
+    static AppLaunchFlag := 128, AfterShowFlags := 4 | 8 | 16 | 32 | 64 | 128
+    static ExistingWindowFollowFlags := 4 | 16
     static Exports() => ["Start", "StopAndWait", "Configure", "SetEnabled", "Cancel", "PublishCache", "Status",
-        "SetPeekEnabled", "ShowPeek", "HidePeek", "HoverCandidates", "AccessibleName", "CompatibilityIntent", "CancelCompatibility", "IntentBytes", "BeginFallback", "InputStatus"]
+        "SetPeekEnabled", "ShowPeek", "HidePeek", "HoverCandidates", "AccessibleName", "CompatibilityIntent", "CancelCompatibility", "IntentBytes", "BeginFallback", "NextInputStatus"]
     static DllPath() {
         dllName := IniRead(A_ScriptDir . "\native\bin\runtime.ini", "Native", "Dll")
         if !RegExMatch(dllName, "^NativeHooks-[a-f0-9]+-x64\.dll$")
@@ -25,7 +27,7 @@ class NativeEngine {
         } finally DllCall("kernel32\FreeLibrary", "ptr", module)
     }
     __New(owner,path := "") {
-        this.Owner := owner, this.Handle := 0, this.EventNumber := 0, this.CacheCount := 0, this.Ready := false, this.CacheAge := 0
+        this.Owner := owner, this.Handle := 0, this.EventNumber := 0, this.InputNumber := 0, this.CacheCount := 0, this.Ready := false, this.CacheAge := 0
         this.HoverState := "", this.UnsupportedApps := ""
         this.StopError := 0, this.StartAttempted := false, this.StartError := 0
         this.Compatibility := 0, this.CompatibilityMoves := 0
@@ -160,13 +162,17 @@ class NativeEngine {
             this.StopCompatibility()
             packaged := !!(fresh.Flags & NativeEngine.PackagedFollowFlag)
             shell := !!(fresh.Flags & NativeEngine.ShellLaunchFlag), verified := !!(fresh.Flags & NativeEngine.VerifiedFollowFlag)
-            label := shell ? "打开窗口随屏" : (verified ? "窗口补充定位" : (packaged ? "应用包窗口补充定位" : "32位兼容定位"))
-            this.Compatibility := {Serial:serial,Target:target,Expires:fresh.Expires,Hwnd:0,Pid:0,Since:0,
-                Requested:false,RequestedAt:0,Recovering:false,MovePlan:0,Label:label,
-                LogLabel:shell ? "shell launch" : (verified ? "verified follow" : (packaged ? "packaged follow" : "32-bit compatibility"))}
+            jumpList := !!(fresh.Flags & NativeEngine.JumpListFlag), appLaunch := !!(fresh.Flags & NativeEngine.AppLaunchFlag)
+            label := appLaunch ? "应用内新窗口随屏" : (jumpList || shell ? "打开窗口随屏"
+                : (verified ? "窗口补充定位" : (packaged ? "应用包窗口补充定位" : "32位兼容定位")))
+            logLabel := appLaunch ? "app launch" : (jumpList ? "taskbar jump list" : (shell ? "shell launch"
+                : (verified ? "verified follow" : (packaged ? "packaged follow" : "32-bit compatibility"))))
+            this.Compatibility := {Serial:serial,Id:fresh.Id,Source:fresh.Source,Observed:0,Target:target,Expires:fresh.Expires,Hwnd:0,Pid:0,Since:0,
+                Requested:false,RequestedAt:0,Recovering:false,MovePlan:0,Label:label,LogLabel:logLabel,AppLaunch:appLaunch ? fresh : 0}
             this.CompatibilitySchedule(true)
         } finally Critical(previousCritical ? previousCritical : "Off")
-        this.Owner.ReportActivity(label . "正在等待所选窗口显示。")
+        if !appLaunch
+            this.Owner.ReportActivity(label . "正在等待所选窗口显示。")
         return true
     }
     ReadCompatibilityIntent(serial) {
@@ -191,16 +197,53 @@ class NativeEngine {
     CompatibilitySnapshot(hwnd) {
         if !hwnd
             return 0
-        return {Hwnd:hwnd,Data:this.Owner.Identity.Get(hwnd),Eligible:Desktop.Eligible(hwnd),
+        state := this.Compatibility
+        source := IsObject(state) && IsObject(state.AppLaunch) ? state.AppLaunch.Source : 0
+        return {Hwnd:hwnd,Data:this.Owner.Identity.Get(hwnd),Eligible:Desktop.Eligible(hwnd,source),Owner:Desktop.Owner(hwnd),
             Visible:DllCall("user32\IsWindowVisible","ptr",hwnd),Minimized:Desktop.IsMin(hwnd),
             Monitor:Desktop.MonitorOf(hwnd)}
     }
-    CompatibilityForeground() => this.CompatibilitySnapshot(Desktop.Foreground())
+    CompatibilityForeground() {
+        hwnd := Desktop.Foreground(), state := this.Compatibility
+        if IsObject(state) && IsObject(state.AppLaunch)
+            && !NativeEngine.NewAppWindow(state.AppLaunch,hwnd,Desktop.Pid(hwnd))
+            return 0
+        return this.CompatibilitySnapshot(hwnd)
+    }
+    static NewAppWindow(intent,hwnd,pid) {
+        if !hwnd || !pid || hwnd = intent.Source || hwnd = intent.Before
+            return false
+        for candidate in intent.Candidates {
+            if candidate.Hwnd = hwnd && candidate.Pid = pid
+                return false
+        }
+        return true
+    }
+    CompatibilityAppOrigin(hwnd) => this.Owner.Identity.Get(hwnd)
+    CompatibilityAppMatches(intent,window) {
+        if !intent.Candidates.Length || intent.Candidates[1].Hwnd != intent.Source
+            || !NativeEngine.NewAppWindow(intent,window.Hwnd,window.Data.Pid)
+            return false
+        sourcePid := intent.Candidates[1].Pid, sameProcess := window.Data.Pid = sourcePid
+        ; A new HWND in the same process is enough when it has no explicit
+        ; AppID. When crossing processes require direct ownership or exact ID.
+        if sameProcess && window.Data.AppId = ""
+            return true
+        origin := this.CompatibilityAppOrigin(intent.Source)
+        if origin.Pid != sourcePid
+            return sameProcess
+        if window.HasOwnProp("Owner") && window.Owner = intent.Source
+            return true
+        if origin.AppId != "" && window.Data.AppId != ""
+            return origin.AppId == window.Data.AppId
+        return sameProcess
+    }
     CompatibilityRescue(intent) {
         ; With no usable in-process hook, Explorer may minimize an application
         ; that was already active on the other screen. Rescue only that exact
         ; pre-click HWND/PID, never an arbitrary minimized group member.
-        if !(intent.Flags & NativeEngine.VerifiedFollowFlag) || !intent.Before || intent.Candidates.Length != 1
+        if !(intent.Flags & NativeEngine.ExistingWindowFollowFlags) || (intent.Flags & NativeEngine.JumpListFlag)
+            || !intent.Before || intent.Candidates.Length != 1
             || intent.Candidates[1].Hwnd != intent.Before || !this.Owner.BringActive
             || this.CompatibilityNow()-intent.Released > 1200
             return 0
@@ -219,38 +262,53 @@ class NativeEngine {
         return state.MovePlan.Start()
     }
     CompatibilityAdvanceMove(state) => state.MovePlan.Advance()
-    static CompatibilityDelay(intent) => (intent.Flags & (NativeEngine.PackagedFollowFlag | NativeEngine.VerifiedFollowFlag)) && intent.NativeClaimed ? 500 : 80
+    static CompatibilityDelay(intent) => (intent.Flags & (NativeEngine.PackagedFollowFlag | NativeEngine.VerifiedFollowFlag
+        | NativeEngine.JumpListFlag)) && intent.NativeClaimed ? 500 : 80
     CompatibilityMatches(intent,window,ownTransition := false) {
         if !IsObject(window) || !window.Hwnd || !window.Data.Pid || !window.Visible || !window.Eligible
             return false
         if window.Minimized && !ownTransition && !(window.HasOwnProp("Recovery") && window.Recovery
-            && (intent.Flags & NativeEngine.VerifiedFollowFlag) && window.Hwnd = intent.Before)
+            && (intent.Flags & NativeEngine.ExistingWindowFollowFlags) && window.Hwnd = intent.Before)
             return false
+        if intent.Flags & NativeEngine.AppLaunchFlag
+            return this.CompatibilityAppMatches(intent,window)
         if intent.Flags & NativeEngine.ShellLaunchFlag
             return window.Hwnd != intent.Before && window.Hwnd != intent.Source
-        if intent.Candidates.Length {
-            for candidate in intent.Candidates {
-                if candidate.Hwnd != window.Hwnd || candidate.Pid != window.Data.Pid
-                    continue
-                if intent.Path != "" && window.Data.Path != "" && StrLower(intent.Path) != StrLower(window.Data.Path)
-                    return false
-                ; A verified HWND/PID can belong to a protected/shared frame
-                ; whose executable cannot be queried. Recheck its exact AppID
-                ; instead of discarding all such application windows.
-                if window.Data.AppId != ""
-                    return this.Owner.Identity.Match(intent.Id,window.Data)
-                return intent.Path != "" && window.Data.Path != "" && StrLower(intent.Path) = StrLower(window.Data.Path)
-                    && !(intent.Flags & 2) && this.Owner.Identity.Match(intent.Id,window.Data)
-            }
+        jumpList := !!(intent.Flags & NativeEngine.JumpListFlag)
+        if jumpList && (window.Hwnd = intent.Before || window.Hwnd = intent.Source)
             return false
+        listed := false
+        for candidate in intent.Candidates {
+            if candidate.Hwnd != window.Hwnd
+                continue
+            if candidate.Pid != window.Data.Pid
+                return false
+            listed := true
+            break
         }
-        if intent.Path = "" || window.Data.Path = "" || StrLower(intent.Path) != StrLower(window.Data.Path)
+        ; While a group is switching, its old foreground can linger. Only an
+        ; explicit single-window click can follow that unchanged foreground.
+        if window.Hwnd = intent.Before && (!listed || intent.Candidates.Length != 1 || !this.Owner.BringActive)
             return false
-        if (intent.Flags & 2) && !(window.Data.AppId != "" && window.Data.AppId == intent.Id)
+        bothPaths := intent.Path != "" && window.Data.Path != ""
+        samePath := bothPaths && StrLower(intent.Path) = StrLower(window.Data.Path)
+        if bothPaths && !samePath
             return false
-        if !this.Owner.Identity.Match(intent.Id,window.Data)
+        if jumpList {
+            ; Menu commands can open a new instance of a verified application.
+            return window.Data.AppId != "" ? this.Owner.Identity.Match(intent.Id,window.Data)
+                : samePath && (intent.Flags & 1) && !(intent.Flags & 2)
+        }
+        if !intent.Candidates.Length && (!samePath || !(intent.Flags & 1)
+            || ((intent.Flags & 2) && !(window.Data.AppId == intent.Id)))
             return false
-        return !!(intent.Flags & 1)
+        ; A fresh exact AppID can establish a new foreground HWND even if the
+        ; taskbar snapshot predates that window. A path-only warm match still
+        ; requires the HWND/PID captured for this button.
+        if window.Data.AppId != ""
+            return this.Owner.Identity.Match(intent.Id,window.Data)
+        return (listed || !intent.Candidates.Length) && samePath && !(intent.Flags & 2)
+            && this.Owner.Identity.Match(intent.Id,window.Data)
     }
     CompatibilityCurrent(state) => IsObject(this.Compatibility) && this.Compatibility = state && this.Handle && this.Owner.Enabled
     StopCompatibility(expected := 0) {
@@ -263,7 +321,7 @@ class NativeEngine {
             state.MovePlan.Cancel()
         return true
     }
-    EndCompatibility(state,text := "",success := false) {
+    EndCompatibility(state,text := "",success := false,outcome := "ended") {
         previousCritical := A_IsCritical
         Critical("On")
         try {
@@ -289,11 +347,23 @@ class NativeEngine {
                 this.Owner.SuccessfulMoves += 1
             }
         } finally Critical(previousCritical ? previousCritical : "Off")
-        if success
-            try this.Owner.Log(state.LogLabel . " confirmed; id=" . current.Id . "; pid=" . state.Pid
-                . "; hwnd=" . state.Hwnd . "; target=" . state.Target.Device)
+        this.LogCompatibilityOutcome(state,success ? "confirmed" : outcome)
         if text != ""
             this.Owner.ReportActivity(text)
+    }
+    LogCompatibilityOutcome(state,outcome) {
+        observed := state.Observed
+        if state.LogLabel = "app launch" && !state.Hwnd
+            return
+        if IsObject(observed)
+            observation := "; observed-hwnd=" . observed.Hwnd . "; observed-pid=" . observed.Data.Pid
+                . "; observed-id=" . observed.Data.AppId . "; observed-eligible=" . observed.Eligible
+                . "; observed-visible=" . observed.Visible . "; observed-minimized=" . observed.Minimized
+        else
+            observation := "; observed-hwnd=0"
+        try this.Owner.Log(state.LogLabel . " " . outcome . "; serial=" . state.Serial . "; id=" . state.Id
+            . "; pid=" . state.Pid . "; hwnd=" . state.Hwnd . "; target=" . state.Target.Device
+            . "; source-hwnd=" . state.Source . observation)
     }
     CompatibilityTick() {
         state := this.Compatibility
@@ -309,29 +379,31 @@ class NativeEngine {
                 return
             if !IsObject(intent) || intent.Serial != state.Serial || !(intent.Flags & NativeEngine.AfterShowFlags) || now >= intent.Expires {
                 this.StopCompatibility(state)
-                if now >= state.Expires
+                if now >= state.Expires && (!IsObject(state.AppLaunch) || state.Hwnd) {
+                    this.LogCompatibilityOutcome(state,state.Hwnd ? "selected-window-timeout" : "no-matching-window")
                     this.Owner.ReportActivity(state.Label . "等待已结束，尚未确认所选窗口到达目标屏幕。")
+                }
                 return
             }
             if !Desktop.Unchanged(state.Target,this.CompatibilityMonitor(intent.Monitor)) {
-                this.EndCompatibility(state)
+                this.EndCompatibility(state,,false,"monitor-changed")
                 return
             }
             if state.Requested && IsObject(state.MovePlan) {
                 window := this.CompatibilitySnapshot(state.Hwnd)
                 if !this.CompatibilityMatches(intent,window,true) || window.Data.Pid != state.Pid {
-                    this.EndCompatibility(state,state.Label . "已结束，所选窗口已发生变化。")
+                    this.EndCompatibility(state,state.Label . "已结束，所选窗口已发生变化。",false,"window-changed")
                     return
                 }
                 if !window.Minimized && !state.Recovering {
                     foreground := this.CompatibilityForeground()
                     if !IsObject(foreground) || foreground.Hwnd != state.Hwnd {
-                        this.EndCompatibility(state,state.Label . "已结束，所选窗口已切换焦点。")
+                        this.EndCompatibility(state,state.Label . "已结束，所选窗口已切换焦点。",false,"focus-changed")
                         return
                     }
                 }
                 if now-state.RequestedAt >= 1000 {
-                    this.EndCompatibility(state,state.Label . "未能确认目标位置，已停止继续尝试。")
+                    this.EndCompatibility(state,state.Label . "未能确认目标位置，已停止继续尝试。",false,"move-timeout")
                     return
                 }
                 previousCritical := A_IsCritical
@@ -350,11 +422,12 @@ class NativeEngine {
                 if result = "waiting"
                     return
                 if result != "complete" {
-                    this.EndCompatibility(state,state.Label . "请求未完成。")
+                    this.EndCompatibility(state,state.Label . "请求未完成。",false,result)
                     return
                 }
             }
             window := this.CompatibilityForeground()
+            state.Observed := window
             if !this.CompatibilityMatches(intent,window) {
                 if state.Requested && state.Recovering
                     window := this.CompatibilitySnapshot(state.Hwnd)
@@ -363,20 +436,20 @@ class NativeEngine {
             }
             if !this.CompatibilityMatches(intent,window) {
                 if state.Requested
-                    this.EndCompatibility(state,state.Label . "已结束，所选窗口已隐藏、最小化或切换焦点。")
+                    this.EndCompatibility(state,state.Label . "已结束，所选窗口已隐藏、最小化或切换焦点。",false,"window-no-longer-matches")
                 else
                     state.Hwnd := 0, state.Pid := 0, state.Since := 0
                 return
             }
             if state.Requested {
                 if window.Hwnd != state.Hwnd || window.Data.Pid != state.Pid {
-                    this.EndCompatibility(state,state.Label . "已结束，所选窗口已发生变化。")
+                    this.EndCompatibility(state,state.Label . "已结束，所选窗口已发生变化。",false,"window-changed")
                     return
                 }
                 if Desktop.SameMonitor(window.Monitor,state.Target)
                     this.EndCompatibility(state,state.Label . "已完成，窗口已在点击的屏幕。",true)
                 else if now-state.RequestedAt >= 1000
-                    this.EndCompatibility(state,state.Label . "未能确认目标位置，已停止继续尝试。")
+                    this.EndCompatibility(state,state.Label . "未能确认目标位置，已停止继续尝试。",false,"move-timeout")
                 return
             }
             if state.Hwnd != window.Hwnd || state.Pid != window.Data.Pid {
@@ -387,7 +460,7 @@ class NativeEngine {
             if now-state.Since < NativeEngine.CompatibilityDelay(intent)
                 return
             if Desktop.SameMonitor(window.Monitor,state.Target) {
-                this.EndCompatibility(state,"所选窗口已在点击的屏幕上。")
+                this.EndCompatibility(state,"所选窗口已在点击的屏幕上。",false,"already-there")
                 return
             }
             ; Window identity queries can dispatch messages. Finish those before
@@ -423,10 +496,10 @@ class NativeEngine {
             if result != "requested" {
                 this.EndCompatibility(state,result = "already-there"
                     ? "所选窗口已在点击的屏幕上。"
-                    : state.Label . "请求未完成。")
+                    : state.Label . "请求未完成。",false,result)
                 return
             }
-            this.Owner.Log(state.LogLabel . " requested; id=" . fresh.Id . "; pid=" . state.Pid
+            this.Owner.Log(state.LogLabel . " requested; serial=" . state.Serial . "; id=" . fresh.Id . "; pid=" . state.Pid
                 . "; hwnd=" . state.Hwnd . "; target=" . state.Target.Device . "; recovering=" . state.Recovering
                 . "; native-claimed=" . fresh.NativeClaimed . "; before=" . fresh.Before
                 . "; since-release-ms=" . (now-fresh.Released) . "; source=" . selected.Monitor.Device
@@ -472,8 +545,14 @@ class NativeEngine {
         ; that skips the controller's remaining helper/hook cleanup.
         try this.Owner.Log("native shutdown incomplete; " . reason . "; Win32=" . this.StopError . "; retained DLL=" . this.Handle)
     }
-    Publish(text) {
-        if !this.Owner.MappingsReady
+    InvalidateCache() {
+        if !this.Handle
+            return
+        DllCall(this.PublishCacheFn,"ptr",0,"uint",0,"uint",3104,"int")
+        this.CacheCount := 0, this.CacheAge := 0, this.Ready := false
+    }
+    Publish(text,epoch) {
+        if epoch != this.Owner.NativeCacheEpoch
             return
         windows := []
         for hwnd in WinGetList() {
@@ -511,12 +590,17 @@ class NativeEngine {
             for number,item in record.Candidates
                 NumPut("uint64",item.Hwnd,"uint",item.Data.Pid,cacheBuffer,offset+2592+(number-1)*16)
         }
-        if !DllCall(this.PublishCacheFn,"ptr",cacheBuffer,"uint",records.Length,"uint",3104,"int")
-            throw Error("原生任务栏缓存提交失败。")
-        ; A publish can run between the poll and watchdog timers. Clear the old
-        ; age before exposing the new count, so startup is not misread as stale.
-        this.CacheAge := 0
-        this.CacheCount := records.Length
+        ; Identity resolution can yield to a display notification or helper
+        ; restart. Keep the epoch check and native cache commit together.
+        criticalState := A_IsCritical
+        Critical "On"
+        try {
+            if !this.Handle || epoch != this.Owner.NativeCacheEpoch
+                return
+            if !DllCall(this.PublishCacheFn,"ptr",cacheBuffer,"uint",records.Length,"uint",3104,"int")
+                throw Error("原生任务栏缓存提交失败。")
+            this.CacheAge := 0, this.CacheCount := records.Length
+        } finally Critical criticalState
         unavailable := ""
         for id in unsupported
             unavailable .= (unavailable = "" ? "" : "; ") . id
@@ -629,21 +713,21 @@ class NativeEngine {
             this.Owner.ReportActivity(messages[kind])
     }
     PollInput() {
-        snapshot := Buffer(704,0)
-        if !DllCall(this.InputStatusFn,"ptr",snapshot,"uint",snapshot.Size,"int")
-            return
-        number := NumGet(snapshot,0,"uint64")
-        if !number || (this.HasOwnProp("InputNumber") && number = this.InputNumber)
-            return
-        this.InputNumber := number
+        snapshot := Buffer(768,0)
         static reasons := Map(1,"pressed",2,"modifier",3,"cooldown",4,"hit-rejected",7,"released",8,"input-cancelled",9,"hold-rejected",10,"drag-rejected")
-        reason := NumGet(snapshot,36,"uint")
-        this.Owner.Log("native input=" . (reasons.Has(reason) ? reasons[reason] : reason)
-            . "; point=" . NumGet(snapshot,8,"int") . "," . NumGet(snapshot,12,"int")
-            . "; root=" . NumGet(snapshot,16,"uint64") . "; class=" . StrGet(snapshot.Ptr+64,64)
-            . "; dpi-awareness=" . NumGet(snapshot,40,"uint") . "; cache-age-ms=" . NumGet(snapshot,24,"uint64")
-            . "; candidates=" . NumGet(snapshot,48,"uint") . "; delta=" . NumGet(snapshot,52,"int") . "," . NumGet(snapshot,56,"int")
-            . "; id=" . StrGet(snapshot.Ptr+192,256))
+        Loop 32 {
+            if !DllCall(this.NextInputStatusFn,"uint64",this.InputNumber,"ptr",snapshot,"uint",snapshot.Size,"int")
+                break
+            this.InputNumber := NumGet(snapshot,0,"uint64")
+            reason := NumGet(snapshot,36,"uint")
+            this.Owner.Log("native input=" . (reasons.Has(reason) ? reasons[reason] : reason)
+                . "; point=" . NumGet(snapshot,8,"int") . "," . NumGet(snapshot,12,"int")
+                . "; target=" . StrGet(snapshot.Ptr+704,32) . "; serial=" . NumGet(snapshot,60,"uint")
+                . "; root=" . NumGet(snapshot,16,"uint64") . "; class=" . StrGet(snapshot.Ptr+64,64)
+                . "; dpi-awareness=" . NumGet(snapshot,40,"uint") . "; cache-age-ms=" . NumGet(snapshot,24,"uint64")
+                . "; candidates=" . NumGet(snapshot,48,"uint") . "; delta=" . NumGet(snapshot,52,"int") . "," . NumGet(snapshot,56,"int")
+                . "; id=" . StrGet(snapshot.Ptr+192,256))
+        }
     }
 }
 TaskbarUIAField(text) => SubStr(StrReplace(StrReplace(text,"`n"," "),"`r"," "),1,1024)

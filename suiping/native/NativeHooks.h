@@ -10,7 +10,9 @@ constexpr unsigned TF_COMPATIBILITY = 4; // explicit-click, after-show routing f
 constexpr unsigned TF_PACKAGED_FOLLOW = 8; // after-show backup for a packaged launch without a cached window
 constexpr unsigned TF_VERIFIED_FOLLOW = 16; // bounded backup for any verified taskbar identity
 constexpr unsigned TF_SHELL_LAUNCH = 32; // new foreground window from an explicit shell/menu click
-constexpr unsigned TF_AFTER_SHOW = TF_COMPATIBILITY | TF_PACKAGED_FOLLOW | TF_VERIFIED_FOLLOW | TF_SHELL_LAUNCH;
+constexpr unsigned TF_JUMP_LIST = 64; // activate the app selected through its taskbar jump list
+constexpr unsigned TF_APP_LAUNCH = 128; // a newly shown window associated with a clicked application
+constexpr unsigned TF_AFTER_SHOW = TF_COMPATIBILITY | TF_PACKAGED_FOLLOW | TF_VERIFIED_FOLLOW | TF_SHELL_LAUNCH | TF_JUMP_LIST | TF_APP_LAUNCH;
 constexpr unsigned TF_TEST_MODE = 1;
 struct NativeCandidate { std::uint64_t hwnd; std::uint32_t pid, reserved; };
 struct alignas(8) NativeEntry {
@@ -35,10 +37,10 @@ struct alignas(8) NativeInputStatus {
     std::uint64_t root, cacheAge;
     unsigned phase, reason, awareness, cacheSequence, count;
     int dx, dy;
-    unsigned reserved;
-    wchar_t rootClass[64], appId[256];
+    unsigned serial;
+    wchar_t rootClass[64], appId[256], target[32];
 };
-static_assert(sizeof(NativeInputStatus) == 704, "AHK input diagnostic ABI");
+static_assert(sizeof(NativeInputStatus) == 768, "AHK input diagnostic ABI");
 struct alignas(8) NativeIntent {
     NativeEntry entry;
     std::uint64_t monitor, released, expires;
@@ -66,6 +68,7 @@ TF_API void TF_Cancel(unsigned cooldownMs);
 TF_API BOOL TF_PublishCache(const NativeEntry* entries, unsigned count, unsigned stride);
 TF_API BOOL TF_Status(NativeStatus* status, unsigned bytes);
 TF_API BOOL TF_InputStatus(NativeInputStatus* status, unsigned bytes);
+TF_API BOOL TF_NextInputStatus(std::uint64_t after, NativeInputStatus* status, unsigned bytes);
 TF_API BOOL TF_CompatibilityIntent(unsigned serial, NativeIntent* intent, unsigned bytes);
 TF_API unsigned TF_IntentBytes();
 // Atomically hands this exact transaction to the after-show controller. Its
@@ -75,7 +78,7 @@ TF_API BOOL TF_BeginFallback(unsigned serial);
 TF_API BOOL TF_CancelCompatibility(unsigned serial);
 // Test mode installs no input hooks and can arm only the test executable's path.
 TF_API BOOL TF_TestArm(const wchar_t* path, HWND window, HMONITOR target);
-TF_API BOOL TF_TestArmIdentity(const wchar_t* path, const wchar_t* appId, HMONITOR target);
+TF_API BOOL TF_TestArmIdentity(const wchar_t* path, const wchar_t* appId, HMONITOR target, BOOL jumpList);
 TF_API void TF_SetPeekEnabled(BOOL enabled);
 TF_API BOOL TF_ShowPeek(HWND source, DWORD pid, HWND popup, int x, int y);
 TF_API void TF_HidePeek();
@@ -89,5 +92,5 @@ TF_API BOOL TF_TestLifecycle(HANDLE startupGate, HANDLE shutdownGate,
 TF_API BOOL TF_TestSetUnhookFailure(BOOL enabled);
 TF_API BOOL TF_TestReleaseEntry(const NativeEntry* entry, HMONITOR target, BOOL preview);
 TF_API BOOL TF_TestShellLaunch(HWND source, HMONITOR target);
-// Simulates only this test process's own window callbacks; sends no OS input.
+// Simulates mouse-button callbacks on owned test windows; sends no OS input.
 TF_API BOOL TF_TestMouseInput(unsigned message, int x, int y);

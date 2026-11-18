@@ -119,4 +119,27 @@ class TaskbarUIA {
     }
 }
 
-
+; Explorer can return an empty taskbar tree during one refresh. Carry that
+; bar's previous rows through the gap only, without renewing their lifetime.
+class TaskbarScanRetention {
+    static CadenceMs := 750
+    Epoch := -1, Fresh := Map()
+    Merge(epoch,observations,startedAt) {
+        previous := epoch = this.Epoch ? this.Fresh : Map()
+        this.Epoch := epoch, this.Fresh := Map(), rows := ""
+        for bar in observations {
+            if bar.Rows != "" {
+                this.Fresh[bar.Hwnd] := bar
+                rows .= bar.Rows
+            } else if previous.Has(bar.Hwnd) {
+                saved := previous[bar.Hwnd]
+                ; Allow one Windows timer tick of scheduler granularity.
+                if saved.Pid = bar.Pid && TaskbarScanRetention.SameRect(saved.Rect,bar.Rect)
+                    && startedAt - saved.At <= TaskbarScanRetention.CadenceMs + 16
+                    rows .= saved.Rows
+            }
+        }
+        return rows
+    }
+    static SameRect(a,b) => a.L = b.L && a.T = b.T && a.R = b.R && a.B = b.B
+}

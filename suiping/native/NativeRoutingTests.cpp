@@ -43,17 +43,65 @@ using CancelFn=void(*)(unsigned);
 using CancelCompatibilityFn=BOOL(*)(unsigned);
 using EnableFn=void(*)(BOOL);
 using StatusFn=BOOL(*)(NativeStatus*,unsigned);
+void CheckAppInput(HMODULE module,HMONITOR monitor) {
+    auto mouse=reinterpret_cast<BOOL(*)(unsigned,int,int)>(GetProcAddress(module,"TF_TestMouseInput"));
+    auto intent=reinterpret_cast<IntentFn>(GetProcAddress(module,"TF_CompatibilityIntent"));
+    auto cancel=reinterpret_cast<CancelFn>(GetProcAddress(module,"TF_Cancel"));
+    MONITORINFO info{sizeof(info)};
+    Check(mouse && intent && cancel && GetMonitorInfoW(monitor,&info),"app click fixture APIs and monitor");
+    const auto original=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    struct DpiGuard { DPI_AWARENESS_CONTEXT context; ~DpiGuard() { SetThreadDpiAwarenessContext(context); } } dpi{original};
+    const int left=info.rcWork.left+40, top=info.rcWork.top+60;
+    const auto fixture=[&](int offset) {
+        return CreateWindowExW(WS_EX_TOPMOST,L"TaskbarFollow.RoutingFixture",L"",WS_OVERLAPPEDWINDOW,
+            left+offset,top,300,230,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    };
+    struct WindowGuard { HWND hwnd; ~WindowGuard() { if (hwnd) DestroyWindow(hwnd); } };
+    WindowGuard source{fixture(0)}, visible{fixture(310)}, hidden{fixture(620)};
+    Check(source.hwnd && visible.hwnd && hidden.hwnd,"create app input source and visible/hidden siblings");
+    ShowWindow(source.hwnd,SW_SHOWNOACTIVATE); ShowWindow(visible.hwnd,SW_SHOWNOACTIVATE);
+    const int x=left+90,y=top+100;
+    Check(GetAncestor(WindowFromPoint({x,y}),GA_ROOT)==source.hwnd,"application is the physical hit target");
+    const auto press=[&] { return mouse(WM_LBUTTONDOWN,x,y)!=FALSE; };
+    const auto release=[&] { return mouse(WM_LBUTTONUP,x,y)!=FALSE; };
+    const unsigned before=Messages.compat;
+    Check(press(),"click an application window");
+    ShowWindow(hidden.hwnd,SW_SHOWNOACTIVATE);
+    Check(release(),"release an app click after another window becomes visible");
+    Wait([&] {return Messages.compat==before+1;});
+    NativeIntent opened{};
+    Check(intent(Messages.serial,&opened,sizeof(opened)) && opened.entry.flags==TF_APP_LAUNCH
+        && opened.monitor==reinterpret_cast<UINT_PTR>(monitor) && opened.source==reinterpret_cast<UINT_PTR>(source.hwnd)
+        && opened.expires-opened.released==2000,"app intent freezes source, physical monitor, and expiry");
+    Check(opened.entry.count>=2 && opened.entry.windows[0].hwnd==opened.source
+        && opened.entry.windows[0].pid==GetCurrentProcessId(),"app intent pins its click source PID");
+    bool foundVisible=false,foundHidden=false;
+    for (unsigned i=0;i<opened.entry.count;++i) {
+        foundVisible|=opened.entry.windows[i].hwnd==reinterpret_cast<UINT_PTR>(visible.hwnd);
+        foundHidden|=opened.entry.windows[i].hwnd==reinterpret_cast<UINT_PTR>(hidden.hwnd);
+    }
+    Check(foundVisible && !foundHidden,"app intent excludes already visible siblings as of mouse-down");
+    cancel(0);
+    Check(!intent(Messages.serial,&opened,sizeof(opened)),"another input invalidates the app intent");
+    const unsigned after=Messages.compat;
+    Check(press() && mouse(WM_LBUTTONUP,x+35,y),"simulate app drag without sending OS input");
+    Drain();
+    Check(Messages.compat==after,"application drag cannot publish an open-window intent");
+}
 void CheckPhysicalInput(HMODULE module,HWND candidate,const std::vector<HMONITOR>& monitors) {
     auto mouse=reinterpret_cast<BOOL(*)(unsigned,int,int)>(GetProcAddress(module,"TF_TestMouseInput"));
     auto publish=reinterpret_cast<BOOL(*)(const NativeEntry*,unsigned,unsigned)>(GetProcAddress(module,"TF_PublishCache"));
     auto status=reinterpret_cast<StatusFn>(GetProcAddress(module,"TF_Status"));
     auto input=reinterpret_cast<BOOL(*)(NativeInputStatus*,unsigned)>(GetProcAddress(module,"TF_InputStatus"));
+    auto nextInput=reinterpret_cast<BOOL(*)(std::uint64_t,NativeInputStatus*,unsigned)>(GetProcAddress(module,"TF_NextInputStatus"));
     auto cancel=reinterpret_cast<CancelFn>(GetProcAddress(module,"TF_Cancel"));
     auto intent=reinterpret_cast<IntentFn>(GetProcAddress(module,"TF_CompatibilityIntent"));
-    Check(mouse && publish && status && input && cancel && intent,"physical input regression ABI");
+    Check(mouse && publish && status && input && nextInput && cancel && intent,"physical input regression ABI");
     WNDCLASSW cls{}; cls.hInstance=GetModuleHandleW(nullptr); cls.lpfnWndProc=DefWindowProcW;
     cls.lpszClassName=L"Shell_SecondaryTrayWnd";
     Check(RegisterClassW(&cls)!=0,"register owned taskbar hit-test fixture");
+    WNDCLASSW menuClass=cls; menuClass.lpszClassName=L"Windows.UI.Core.CoreWindow";
+    Check(RegisterClassW(&menuClass)!=0,"register owned jump-list hit-test fixture");
     for (HMONITOR monitor:monitors) {
         const auto original=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         MONITORINFO info{sizeof(info)};
@@ -78,6 +126,8 @@ void CheckPhysicalInput(HMODULE module,HWND candidate,const std::vector<HMONITOR
             const auto previous=SetThreadDpiAwarenessContext(context);
             Check(previous!=nullptr,"set caller DPI context for input callback");
             NativeStatus before{},after{};
+            NativeInputStatus prior{};
+            Check(input(&prior,sizeof(prior))!=FALSE,"read diagnostic cursor before click");
             Check(publish(&entry,1,sizeof(entry))!=FALSE,"publish physical fixture button");
             Check(status(&before,sizeof(before))!=FALSE,"read before callback input status");
             Check(mouse(WM_LBUTTONDOWN,x,y)!=FALSE,"simulate owned mouse-down callback without sending input");
@@ -98,6 +148,13 @@ void CheckPhysicalInput(HMODULE module,HWND candidate,const std::vector<HMONITOR
             NativeIntent click{};
             Check(intent(Messages.serial,&click,sizeof(click))!=FALSE,
                 "after-show controller can read the physical click from every caller DPI context");
+            NativeInputStatus press{},release{};
+            Check(nextInput(prior.number,&press,sizeof(press)) && nextInput(press.number,&release,sizeof(release))
+                && press.phase==1 && release.phase==2 && release.number==observation.number,
+                "diagnostics preserve both halves of a quick click between polls");
+            Check(press.point.x==x && press.point.y==y && wcscmp(press.target,target.szDevice)==0
+                && wcscmp(release.target,target.szDevice)==0 && release.serial==click.serial,
+                "diagnostics link the original physical point and target to the routed transaction");
             cancel(0);
             Check(status(&before,sizeof(before))!=FALSE,"read before drag rejection");
             Check(mouse(WM_LBUTTONDOWN,x,y) && mouse(WM_LBUTTONUP,x+30,y),"simulate owned taskbar drag");
@@ -110,6 +167,48 @@ void CheckPhysicalInput(HMODULE module,HWND candidate,const std::vector<HMONITOR
             Check(input(&observation,sizeof(observation)) && observation.reason==8,"diagnostics retain input cancellation");
             SetThreadDpiAwarenessContext(previous);
         }
+        const auto menuDpi=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        const int menuX=x, menuY=entry.button.top-70;
+        HWND menu=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,menuClass.lpszClassName,L"",WS_POPUP,
+            menuX-60,menuY-60,120,130,nullptr,nullptr,cls.hInstance,nullptr);
+        Check(menu!=nullptr,"create owned popup above taskbar");
+        WindowGuard ownedMenu{menu}; ShowWindow(menu,SW_SHOWNOACTIVATE);
+        Check(GetAncestor(WindowFromPoint({menuX,menuY}),GA_ROOT)==menu,"popup is the physical hit-test target");
+        SetThreadDpiAwarenessContext(menuDpi);
+        const auto openMenu=[&] { return mouse(WM_RBUTTONDOWN,x,y) && mouse(WM_RBUTTONUP,x,y); };
+        const auto selectMenu=[&] { return mouse(WM_LBUTTONDOWN,menuX,menuY) && mouse(WM_LBUTTONUP,menuX,menuY); };
+        NativeStatus beforeMenu{},afterMenu{};
+        Check(status(&beforeMenu,sizeof(beforeMenu)) && publish(&entry,1,sizeof(entry)),"publish before testing owned jump-list selection");
+        Check(mouse(WM_LBUTTONDOWN,x,entry.button.top) && mouse(WM_LBUTTONUP,x,entry.button.top-1),
+            "release across the edge of the taskbar while inside the drag tolerance");
+        Check(status(&afterMenu,sizeof(afterMenu)) && beforeMenu.armed==afterMenu.armed,
+            "a taskbar click released over another surface does not arm positioning");
+        Check(SUCCEEDED(SetThreadDescription(GetCurrentThread(),L"RoutingTests")) && openMenu() && selectMenu(),"click another CoreWindow class instance");
+        Check(status(&afterMenu,sizeof(afterMenu)) && beforeMenu.armed==afterMenu.armed,"CoreWindow class alone cannot arm a jump-list selection");
+        Check(SUCCEEDED(SetThreadDescription(GetCurrentThread(),L"JumpViewUI")) && selectMenu(),"click jump-list-shaped popup without a matching right click");
+        Check(status(&afterMenu,sizeof(afterMenu)) && beforeMenu.armed==afterMenu.armed,"a jump-list popup requires its taskbar context");
+        const unsigned beforeMessage=Messages.compat;
+        Check(openMenu() && status(&afterMenu,sizeof(afterMenu)) && beforeMenu.armed==afterMenu.armed,
+            "right-clicking the app button never moves a window");
+        Check(selectMenu(),"select from the opened jump list");
+        Drain();
+        NativeIntent selection{};
+        Check(Messages.compat==beforeMessage+1 && intent(Messages.serial,&selection,sizeof(selection)),"menu selection posts an after-show intent");
+        Check(selection.entry.flags==TF_JUMP_LIST && wcscmp(selection.entry.appId,entry.appId)==0
+            && selection.source==reinterpret_cast<UINT_PTR>(menu) && selection.monitor==reinterpret_cast<UINT_PTR>(monitor),
+            "jump-list selection retains the verified app identity and physical source monitor");
+        NativeEntry compatible=entry;
+        compatible.count=0; compatible.flags=TF_COLD_START|TF_COMPATIBILITY;
+        Check(publish(&compatible,1,sizeof(compatible)) && openMenu() && selectMenu(),"select a verified x86 jump-list launch");
+        Drain();
+        Check(intent(Messages.serial,&selection,sizeof(selection))
+            && selection.entry.flags==(TF_JUMP_LIST|TF_COLD_START|TF_COMPATIBILITY),
+            "jump-list selection preserves the executable's after-show requirement");
+        Check(status(&beforeMenu,sizeof(beforeMenu)) && openMenu(),"start a second owned menu interaction");
+        cancel(0);
+        Check(selectMenu() && status(&afterMenu,sizeof(afterMenu)) && beforeMenu.armed==afterMenu.armed,
+            "an intervening input epoch invalidates the menu context");
+        ShowWindow(menu,SW_HIDE);
         // A foreground window covering the taskbar must continue to prevent a
         // match, even when its coordinates overlap a valid cached button.
         const auto saved=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -251,6 +350,7 @@ int wmain(int argc,wchar_t** argv) {
         wcscpy_s(entry.path,L"C:\\not-the-test-executable.exe"); entry.flags=TF_COLD_START|TF_COMPATIBILITY;
         Check(!release(&entry,target,FALSE),"test route cannot target an unrelated executable");
         CheckPhysicalInput(module,statusWindow,monitors);
+        CheckAppInput(module,target);
         Check(stop(3000)!=FALSE,"routing controller joins before resource release");
         Check(!intent(Messages.serial,&snapshot,sizeof(snapshot)),"a stopped controller exposes no stale intent");
         printf("PASS %u native explicit-click/self-window/compatibility routing assertions; no input hooks\n",Checks);

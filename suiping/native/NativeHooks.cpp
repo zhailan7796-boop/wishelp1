@@ -528,6 +528,14 @@ bool ColdClassMatches(const NativeEntry& entry,HWND hwnd) {
     return wcscmp(entry.appId,L"Microsoft.Windows.Explorer")!=0
         || ClassIs(hwnd,L"CabinetWClass") || ClassIs(hwnd,L"ExploreWClass");
 }
+bool SupportsInProcessPlacement(const Transaction& tx,HWND hwnd) {
+    if (tx.entry.flags&(TF_COMPATIBILITY|TF_SHELL_LAUNCH|TF_APP_LAUNCH)) return false;
+    // A cold jump-list launch has the same verified executable identity as a
+    // normal cold taskbar click. With existing windows, wait for the selected
+    // foreground instead of letting an unrelated window hook claim the menu.
+    return !(tx.entry.flags&TF_JUMP_LIST)
+        || (tx.entry.count==0 && (tx.entry.flags&TF_COLD_START) && Id(hwnd)!=tx.before && Id(hwnd)!=tx.source);
+}
 bool ColdExistingMatches(const Transaction& tx,HWND hwnd) {
     if (tx.entry.count || !(tx.entry.flags&TF_COLD_START) || (IsWindowVisible(hwnd) && !IsIconic(hwnd))
         || !ColdClassMatches(tx.entry,hwnd)) return false;
@@ -540,8 +548,8 @@ bool ProcessCbt(int code,WPARAM wparam,LPARAM lparam) {
     Shared* shared=GetShared(); Transaction tx;
     if (!Snapshot(shared,tx)) return false;
     if (FallbackOwns(shared,tx)) return false;
-    if (tx.entry.flags&TF_COMPATIBILITY) return false;
     HWND hwnd=reinterpret_cast<HWND>(wparam);
+    if (!SupportsInProcessPlacement(tx,hwnd)) return false;
     if (code==HCBT_DESTROYWND && ((tx.preview && Candidate(tx,hwnd))
         || Read64(shared->claim)==(static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32)|static_cast<unsigned>(reinterpret_cast<UINT_PTR>(hwnd))))) {
         // Closing a preview can activate another group member. It is not a selection.
@@ -594,7 +602,7 @@ LRESULT CALLBACK ObserveMessages(int code,WPARAM wparam,LPARAM lparam) {
             Shared* shared=GetShared(); Transaction tx;
             // Observe a reused window's show notification while it is still
             // hidden, then protect the following placement before first paint.
-            if (Snapshot(shared,tx) && !(tx.entry.flags&TF_COMPATIBILITY) && !tx.preview
+            if (Snapshot(shared,tx) && SupportsInProcessPlacement(tx,message->hwnd) && !tx.preview
                 && Eligible(message->hwnd) && ColdExistingMatches(tx,message->hwnd)
                 && StillCurrent(shared,tx) && Claim(shared,tx,message->hwnd)) {
                 WINDOWPLACEMENT placement{sizeof(placement)};
@@ -630,7 +638,7 @@ void Arm(Shared* shared,const NativeEntry& entry,HMONITOR monitor,HWND before,bo
     Transaction tx{}; tx.entry=entry; tx.monitor=Id(monitor); tx.before=Id(before); tx.source=Id(source);
     tx.target.cbSize=sizeof(tx.target);
     if (!GetMonitorInfoW(monitor,&tx.target)) return;
-    tx.released=Now(); tx.expires=tx.released+((entry.flags&TF_SHELL_LAUNCH)?2000:(preview ? 1800 : static_cast<unsigned>(Read32(shared->timeoutMs)))); tx.preview=preview?1u:0u;
+    tx.released=Now(); tx.expires=tx.released+((entry.flags&(TF_SHELL_LAUNCH|TF_APP_LAUNCH))?2000:(preview ? 1800 : static_cast<unsigned>(Read32(shared->timeoutMs)))); tx.preview=preview?1u:0u;
     tx.serial=static_cast<unsigned>(InterlockedIncrement(&shared->serial));
     tx.epoch=static_cast<unsigned>(InterlockedIncrement(&shared->inputEpoch));
     InterlockedIncrement(&shared->txSequence);
@@ -638,32 +646,51 @@ void Arm(Shared* shared,const NativeEntry& entry,HMONITOR monitor,HWND before,bo
     InterlockedExchange64(&shared->claim,static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32));
     InterlockedExchange64(&shared->fallback,static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32));
     MemoryBarrier(); InterlockedIncrement(&shared->txSequence);
-    InterlockedIncrement64(&shared->armed); Event(shared,TF_ARMED,nullptr,&tx);
+    InterlockedIncrement64(&shared->armed);
+    if (!(entry.flags&TF_APP_LAUNCH)) Event(shared,TF_ARMED,nullptr,&tx);
 }
+enum class ClickKind { Taskbar, Preview, ShellLaunch, JumpList, AppLaunch };
 struct ClickState {
     NativeEntry entry{}; POINT down{}; HMONITOR monitor{}; HWND before{};
-    std::uint64_t downAt{}, hoverAt{}; bool valid{}, preview{}, group{}, shell{};
+    std::uint64_t downAt{}, hoverAt{}; bool valid{}, group{};
+    ClickKind kind{};
     HWND source{};
     unsigned epoch{};
 };
 ClickState Click;
-NativeInputStatus InputStatus{};
-volatile LONG InputStatusSequence{};
+NativeEntry ClickApp{};
+struct JumpListContext {
+    NativeEntry entry{};
+    POINT down{};
+    HWND before{};
+    std::uint64_t at{};
+    unsigned epoch{};
+    bool released{};
+} JumpList;
+constexpr std::uint64_t InputHistorySize=32;
+NativeInputStatus InputHistory[InputHistorySize]{};
+std::uint64_t InputNumber{};
+SRWLOCK InputStatusLock=SRWLOCK_INIT;
 SRWLOCK ClickLock=SRWLOCK_INIT;
-void TraceInput(Shared* shared,POINT point,HWND root,const NativeEntry& entry,unsigned reason,unsigned phase=1) {
-    InterlockedIncrement(&InputStatusSequence);
-    ++InputStatus.number;
-    InputStatus.point=point; InputStatus.root=Id(root);
-    InputStatus.cacheAge=Now()-static_cast<std::uint64_t>(Read64(shared->cacheAt));
-    InputStatus.phase=phase; InputStatus.reason=reason;
-    InputStatus.awareness=static_cast<unsigned>(GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()));
-    InputStatus.cacheSequence=static_cast<unsigned>(Read32(shared->cacheSequence));
-    InputStatus.count=entry.count;
-    InputStatus.dx=phase==2 ? point.x-Click.down.x : 0;
-    InputStatus.dy=phase==2 ? point.y-Click.down.y : 0;
-    GetClassNameW(root,InputStatus.rootClass,64);
-    wcsncpy_s(InputStatus.appId,entry.appId,_TRUNCATE);
-    MemoryBarrier(); InterlockedIncrement(&InputStatusSequence);
+void TraceInput(Shared* shared,POINT point,HWND root,const NativeEntry& entry,unsigned reason,
+    HMONITOR monitor,unsigned phase=1,unsigned serial=0) {
+    NativeInputStatus trace{};
+    trace.point=point; trace.root=Id(root);
+    trace.cacheAge=Now()-static_cast<std::uint64_t>(Read64(shared->cacheAt));
+    trace.phase=phase; trace.reason=reason; trace.serial=serial;
+    trace.awareness=static_cast<unsigned>(GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()));
+    trace.cacheSequence=static_cast<unsigned>(Read32(shared->cacheSequence));
+    trace.count=entry.count;
+    if (phase==2) { trace.dx=point.x-Click.down.x; trace.dy=point.y-Click.down.y; }
+    GetClassNameW(root,trace.rootClass,64);
+    wcsncpy_s(trace.appId,entry.appId,_TRUNCATE);
+    MONITORINFOEXW target{}; target.cbSize=sizeof(target);
+    if (GetMonitorInfoW(monitor,&target)) wcsncpy_s(trace.target,target.szDevice,_TRUNCATE);
+    // Diagnostics must never delay input while the controller reads the queue.
+    if (!TryAcquireSRWLockExclusive(&InputStatusLock)) return;
+    trace.number=++InputNumber;
+    InputHistory[trace.number%InputHistorySize]=trace;
+    ReleaseSRWLockExclusive(&InputStatusLock);
 }
 void SetHoverEntry(const NativeEntry& entry) {
     AcquireSRWLockExclusive(&ClickLock); Click.entry=entry; ReleaseSRWLockExclusive(&ClickLock);
@@ -702,18 +729,83 @@ bool FindHoverEntry(Shared* shared,HWND source,DWORD pid,HMONITOR monitor,Native
 bool ShellLaunchSurface(HWND root) {
     if (!root || ShellBar(root) || Preview(root)) return false;
     // Shell windows cover desktop shortcuts and modern desktop menus. Native
-    // menus also cover commands that open a separate application. This never
-    // treats an ordinary click inside an application as a launch intent.
+    // menus also cover commands that open a separate application.
     DWORD pid{},shellPid{};
     GetWindowThreadProcessId(root,&pid); GetWindowThreadProcessId(GetShellWindow(),&shellPid);
     return ClassIs(root,L"#32768") || (pid && pid==shellPid);
 }
-bool ReleaseShellLaunch(Shared* shared,HMONITOR target,HWND before,HWND source) {
-    NativeEntry launch{}; launch.flags=TF_SHELL_LAUNCH;
-    Arm(shared,launch,target,before,false,source);
+bool VisibleAppSurface(HWND hwnd) {
+    if (!IsWindowVisible(hwnd)) return false;
+    const auto ex=GetWindowLongPtrW(hwnd,GWL_EXSTYLE);
+    return !(ex&(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE)) && !(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_CHILD);
+}
+BOOL CALLBACK CaptureVisibleApp(HWND hwnd,LPARAM parameter) {
+    auto& entry=*reinterpret_cast<NativeEntry*>(parameter);
+    if (Id(hwnd)==entry.windows[0].hwnd || !VisibleAppSurface(hwnd)) return TRUE;
+    const HWND owner=GetWindow(hwnd,GW_OWNER);
+    if (owner && Id(owner)!=entry.windows[0].hwnd && !(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_APPWINDOW)) return TRUE;
+    wchar_t cls[64]{};
+    GetClassNameW(hwnd,cls,64);
+    for (const auto shellClass : {L"Shell_TrayWnd",L"Shell_SecondaryTrayWnd",L"TaskListThumbnailWnd",L"Progman",L"WorkerW",L"Windows.UI.Core.CoreWindow"})
+        if (wcscmp(cls,shellClass)==0) return TRUE;
+    DWORD pid{};
+    if (!GetWindowThreadProcessId(hwnd,&pid) || !pid) return TRUE;
+    if (entry.count==TF_MAX_WINDOWS) return FALSE;
+    entry.windows[entry.count++]={Id(hwnd),pid,0};
+    return TRUE;
+}
+bool CaptureAppLaunch(Shared* shared,HWND source,NativeEntry& entry) {
+    if (!source || ShellBar(source) || Preview(source) || ClassIs(source,L"Windows.UI.Core.CoreWindow")
+        || !VisibleAppSurface(source)) return false;
+    DWORD pid{};
+    if (!GetWindowThreadProcessId(source,&pid) || !pid || (pid==shared->ownerPid && !(StartFlags&TF_TEST_MODE))) return false;
+    entry={}; entry.flags=TF_APP_LAUNCH;
+    // The first pair identifies the click source. The others exclude already
+    // visible windows, including minimized ones and siblings in other processes.
+    entry.windows[entry.count++]={Id(source),pid,0};
+    return EnumWindows(CaptureVisibleApp,reinterpret_cast<LPARAM>(&entry))!=FALSE;
+}
+bool AppReleaseMatches(HWND root,POINT point) {
+    const auto sourcePid=ClickApp.windows[0].pid;
+    DWORD currentSourcePid{};
+    GetWindowThreadProcessId(Click.source,&currentSourcePid);
+    if (currentSourcePid!=sourcePid || MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST)!=Click.monitor) return false;
+    if (root==Click.source) return true;
+    // An application may create its window on mouse-down, placing it under
+    // the still-held pointer. Keep that press only for a newly visible sibling.
+    DWORD rootPid{}; GetWindowThreadProcessId(root,&rootPid);
+    if (rootPid!=sourcePid) return false;
+    for (unsigned i=1;i<ClickApp.count;++i)
+        if (ClickApp.windows[i].hwnd==Id(root) && ClickApp.windows[i].pid==rootPid) return false;
+    return true;
+}
+bool JumpListSurface(HWND root) {
+    // The Windows 11 jump list runs on its own shell UI thread. Other windows
+    // (including Start) also use CoreWindow, so the class alone is ambiguous.
+    if (!ClassIs(root,L"Windows.UI.Core.CoreWindow")) return false;
+    const DWORD tid=GetWindowThreadProcessId(root,nullptr);
+    HANDLE thread=tid ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,tid) : nullptr;
+    if (!thread) return false;
+    PWSTR description{};
+    const HRESULT result=GetThreadDescription(thread,&description);
+    CloseHandle(thread);
+    const bool matched=SUCCEEDED(result) && description && wcscmp(description,L"JumpViewUI")==0;
+    if (description) LocalFree(description);
+    return matched;
+}
+bool ReleaseOpenIntent(Shared* shared,HMONITOR target,HWND before,HWND source,const NativeEntry& entry) {
+    Arm(shared,entry,target,before,false,source);
     if (ControllerOwner && PostMessageW(ControllerOwner,CompatibilityCommand,
         static_cast<WPARAM>(Read32(shared->serial)),reinterpret_cast<LPARAM>(target))) return true;
     Cancel(shared); return false;
+}
+bool ReleaseShellLaunch(Shared* shared,HMONITOR target,HWND before,HWND source,const NativeEntry* app=nullptr) {
+    NativeEntry entry{};
+    if (app) {
+        entry=*app;
+        entry.flags=TF_JUMP_LIST|(app->flags&(TF_COLD_START|TF_REQUIRE_APP_ID|TF_COMPATIBILITY));
+    } else entry.flags=TF_SHELL_LAUNCH;
+    return ReleaseOpenIntent(shared,target,before,source,entry);
 }
 bool ReleaseEntry(Shared* shared,const NativeEntry& entry,HMONITOR target,HWND before,bool preview) {
     if (wcscmp(entry.appId,L"TaskbarFollow.Status")==0 && entry.count==1
@@ -739,6 +831,10 @@ bool Modified() {
     for (int key : {VK_SHIFT,VK_CONTROL,VK_MENU,VK_LWIN,VK_RWIN}) if (GetAsyncKeyState(key)&0x8000) return true;
     return false;
 }
+bool WithinClickDrag(POINT down,POINT up) {
+    return abs(up.x-down.x)<=std::max(4,GetSystemMetrics(SM_CXDRAG))
+        && abs(up.y-down.y)<=std::max(4,GetSystemMetrics(SM_CYDRAG));
+}
 LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
     Shared* shared=Controller.data;
     if (code<0 || !Live(shared)) return CallNextHookEx(nullptr,code,message,pointer);
@@ -760,25 +856,36 @@ LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
         }
     } else if (message==WM_LBUTTONDOWN) {
         QueuePeekHide();
+        const auto previousEpoch=static_cast<unsigned>(Read32(shared->inputEpoch));
         Transaction previous; const bool hadPrevious=Snapshot(shared,previous);
         Cancel(shared); Click.valid=false;
-        if (hadPrevious) { InterlockedIncrement64(&shared->cancelled); Event(shared,TF_CANCEL,nullptr,&previous); }
+        if (hadPrevious && !(previous.entry.flags&TF_APP_LAUNCH)) { InterlockedIncrement64(&shared->cancelled); Event(shared,TF_CANCEL,nullptr,&previous); }
         HWND root=GetAncestor(WindowFromPoint(input.pt),GA_ROOT); NativeEntry entry{};
         const bool isPreview=Preview(root);
-        Click.shell=false;
+        const HMONITOR monitor=MonitorFromPoint(input.pt,MONITOR_DEFAULTTONEAREST);
+        const bool plainClick=!Modified() && Now()>=static_cast<std::uint64_t>(Read64(shared->coolUntil));
+        const bool taskbarMenu=JumpList.at && JumpList.released && JumpList.epoch==previousEpoch && Now()-JumpList.at<=30000;
         if (isPreview) RefreshHoverEntry(shared);
-        if (!Modified() && Now()>=static_cast<std::uint64_t>(Read64(shared->coolUntil))
+        if (plainClick && taskbarMenu
+            && MonitorFromWindow(Window(JumpList.entry.taskbar),MONITOR_DEFAULTTONULL)==monitor && JumpListSurface(root)) {
+            SetHoverEntry(JumpList.entry); Click.kind=ClickKind::JumpList; Click.valid=true;
+        } else if (plainClick
             && ((ShellBar(root) && CacheHit(shared,input.pt,root,entry))
                 || (isPreview && Now()-Click.hoverAt<8000 && Click.entry.count>0
-                    && MonitorFromPoint(input.pt,MONITOR_DEFAULTTONEAREST)==Click.monitor && (entry=Click.entry,true)))) {
-            SetHoverEntry(entry); Click.down=input.pt; Click.downAt=Now(); Click.before=GetForegroundWindow();
-            Click.monitor=MonitorFromPoint(input.pt,MONITOR_DEFAULTTONEAREST);
-            Click.preview=isPreview; Click.valid=true;
-            Click.epoch=static_cast<unsigned>(Read32(shared->inputEpoch));
-        } else if (!Modified() && Now()>=static_cast<std::uint64_t>(Read64(shared->coolUntil)) && ShellLaunchSurface(root)) {
-            Click.down=input.pt; Click.downAt=Now(); Click.before=GetForegroundWindow();
-            Click.monitor=MonitorFromPoint(input.pt,MONITOR_DEFAULTTONEAREST);
-            Click.source=root; Click.preview=false; Click.shell=true; Click.valid=true;
+                    && monitor==Click.monitor && (entry=Click.entry,true)))) {
+            SetHoverEntry(entry); Click.kind=isPreview ? ClickKind::Preview : ClickKind::Taskbar;
+            Click.valid=true;
+        } else if (plainClick && ShellLaunchSurface(root)) {
+            Click.kind=ClickKind::ShellLaunch; Click.valid=true;
+        } else if (plainClick && CaptureAppLaunch(shared,root,ClickApp)) {
+            Click.kind=ClickKind::AppLaunch; Click.valid=true;
+            Click.hoverAt=0;
+        }
+        JumpList.at=0;
+        if (Click.valid) {
+            Click.down=input.pt; Click.downAt=Now(); Click.monitor=monitor;
+            Click.before=Click.kind==ClickKind::JumpList ? JumpList.before : GetForegroundWindow();
+            Click.source=root;
             Click.epoch=static_cast<unsigned>(Read32(shared->inputEpoch));
         }
         // Keep a bounded snapshot for taskbar-area input, including a rejected
@@ -795,32 +902,59 @@ LRESULT CALLBACK Mouse(int code,WPARAM message,LPARAM pointer) {
             MemoryBarrier();
             if (sequence!=Read32(shared->cacheSequence)) nearButton=false;
         }
-        if (ShellBar(root) || isPreview || nearButton)
-            TraceInput(shared,input.pt,root,Click.valid ? Click.entry : nearby,
-                Click.valid ? 1u : (Modified()?2u:(Now()<static_cast<std::uint64_t>(Read64(shared->coolUntil))?3u:4u)));
+        if ((ShellBar(root) || isPreview || nearButton || taskbarMenu) && !(Click.valid && Click.kind==ClickKind::AppLaunch))
+            TraceInput(shared,input.pt,root,Click.valid && Click.kind!=ClickKind::ShellLaunch ? Click.entry : nearby,
+                Click.valid ? 1u : (Modified()?2u:(Now()<static_cast<std::uint64_t>(Read64(shared->coolUntil))?3u:4u)),monitor);
     } else if (message==WM_LBUTTONUP && Click.valid) {
         Click.valid=false;
         const bool validEpoch=Click.epoch==static_cast<unsigned>(Read32(shared->inputEpoch));
         const bool validTime=Now()-Click.downAt<=1500;
-        const bool validDrag=abs(input.pt.x-Click.down.x)<=std::max(4,GetSystemMetrics(SM_CXDRAG))
-            && abs(input.pt.y-Click.down.y)<=std::max(4,GetSystemMetrics(SM_CYDRAG));
-        if (!Click.shell)
-            TraceInput(shared,input.pt,GetAncestor(WindowFromPoint(input.pt),GA_ROOT),Click.entry,
-                Modified()?2u:(!validEpoch?8u:(!validTime?9u:(!validDrag?10u:7u))),2);
-        if (!Modified() && Click.epoch==static_cast<unsigned>(Read32(shared->inputEpoch)) && Now()-Click.downAt<=1500
-            && abs(input.pt.x-Click.down.x)<=std::max(4,GetSystemMetrics(SM_CXDRAG))
-            && abs(input.pt.y-Click.down.y)<=std::max(4,GetSystemMetrics(SM_CYDRAG))) {
+        const bool validDrag=WithinClickDrag(Click.down,input.pt);
+        const bool modified=Modified();
+        const HWND root=GetAncestor(WindowFromPoint(input.pt),GA_ROOT);
+        const bool staysOnMonitor=MonitorFromPoint(input.pt,MONITOR_DEFAULTTONULL)==Click.monitor;
+        const bool sameSurface=staysOnMonitor && (Click.kind==ClickKind::AppLaunch ? AppReleaseMatches(root,input.pt)
+            : (Click.kind!=ClickKind::JumpList && Click.kind!=ClickKind::Taskbar) || root==Click.source);
+        const LONG serialBefore=Read32(shared->serial);
+        if (!modified && validEpoch && validTime && validDrag && sameSurface) {
             Click.hoverAt=Now();
-            if (Click.shell) {
+            if (Click.kind==ClickKind::JumpList) {
+                Click.hoverAt=0;
+                ReleaseShellLaunch(shared,Click.monitor,Click.before,Click.source,&Click.entry);
+            } else if (Click.kind==ClickKind::ShellLaunch) {
                 ReleaseShellLaunch(shared,Click.monitor,Click.before,Click.source);
-            } else ReleaseEntry(shared,Click.entry,Click.monitor,Click.before,Click.preview);
+            } else if (Click.kind==ClickKind::AppLaunch) {
+                Click.hoverAt=0;
+                ReleaseOpenIntent(shared,Click.monitor,Click.before,Click.source,ClickApp);
+            } else {
+                ReleaseEntry(shared,Click.entry,Click.monitor,Click.before,Click.kind==ClickKind::Preview);
+            }
         }
+        if (Click.kind!=ClickKind::ShellLaunch && Click.kind!=ClickKind::AppLaunch) {
+            const LONG serial=Read32(shared->serial);
+            const unsigned reason=modified?2u:(!validEpoch?8u:(!validTime?9u:(!validDrag?10u:7u)));
+            TraceInput(shared,input.pt,root,Click.entry,sameSurface ? reason : 4u,Click.monitor,2,
+                serial==serialBefore ? 0u : static_cast<unsigned>(serial));
+        }
+    } else if (message==WM_RBUTTONUP && JumpList.at && !JumpList.released) {
+        const HWND root=GetAncestor(WindowFromPoint(input.pt),GA_ROOT);
+        JumpList.released=!Modified() && JumpList.epoch==static_cast<unsigned>(Read32(shared->inputEpoch))
+            && root==Window(JumpList.entry.taskbar) && PtInRect(&JumpList.entry.button,input.pt)
+            && Now()-JumpList.at<=1500 && WithinClickDrag(JumpList.down,input.pt);
+        JumpList.at=JumpList.released ? Now() : 0;
     } else if (message==WM_RBUTTONDOWN || message==WM_MBUTTONDOWN || message==WM_XBUTTONDOWN
         || message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL) {
         Transaction previous; const bool hadPrevious=Snapshot(shared,previous);
         QueuePeekHide();
-        Click.valid=false; Click.hoverAt=0; Cancel(shared);
-        if (hadPrevious) { InterlockedIncrement64(&shared->cancelled); Event(shared,TF_CANCEL,nullptr,&previous); }
+        Click.valid=false; Click.hoverAt=0; JumpList.at=0; Cancel(shared);
+        if (hadPrevious && !(previous.entry.flags&TF_APP_LAUNCH)) { InterlockedIncrement64(&shared->cancelled); Event(shared,TF_CANCEL,nullptr,&previous); }
+        if (message==WM_RBUTTONDOWN && !Modified() && Now()>=static_cast<std::uint64_t>(Read64(shared->coolUntil))) {
+            const HWND root=GetAncestor(WindowFromPoint(input.pt),GA_ROOT);
+            NativeEntry entry{};
+            if (ShellBar(root) && CacheHit(shared,input.pt,root,entry)) {
+                JumpList={entry,input.pt,GetForegroundWindow(),Now(),static_cast<unsigned>(Read32(shared->inputEpoch)),false};
+            }
+        }
     }
     }
     return CallNextHookEx(nullptr,code,message,pointer);
@@ -829,8 +963,8 @@ LRESULT CALLBACK Keyboard(int code,WPARAM message,LPARAM pointer) {
     if (code>=0 && Controller.data && (message==WM_KEYDOWN || message==WM_SYSKEYDOWN)) {
         QueuePeekHide();
         Transaction previous; const bool hadPrevious=Snapshot(Controller.data,previous);
-        Click.valid=false; Click.hoverAt=0; Cancel(Controller.data);
-        if (hadPrevious) { InterlockedIncrement64(&Controller.data->cancelled); Event(Controller.data,TF_CANCEL,nullptr,&previous); }
+        Click.valid=false; Click.hoverAt=0; JumpList.at=0; Cancel(Controller.data);
+        if (hadPrevious && !(previous.entry.flags&TF_APP_LAUNCH)) { InterlockedIncrement64(&Controller.data->cancelled); Event(Controller.data,TF_CANCEL,nullptr,&previous); }
         // Never retain key values.
     }
     return CallNextHookEx(nullptr,code,message,pointer);
@@ -903,7 +1037,7 @@ DWORD RunInputThread() {
             }
             Transaction tx;
             if (Snapshot(Controller.data,tx,true) && Now()>tx.expires) {
-                if (CancelTransaction(Controller.data,tx)) Event(Controller.data,TF_EXPIRED,nullptr,&tx);
+                if (CancelTransaction(Controller.data,tx) && !(tx.entry.flags&TF_APP_LAUNCH)) Event(Controller.data,TF_EXPIRED,nullptr,&tx);
             }
         }
         if (message.message==PeekCommand) {
@@ -1124,11 +1258,21 @@ BOOL TF_Status(NativeStatus* status,unsigned bytes) {
 }
 BOOL TF_InputStatus(NativeInputStatus* status,unsigned bytes) {
     if (!Controller.data || !status || bytes!=sizeof(*status)) return FALSE;
-    const LONG sequence=Read32(InputStatusSequence);
-    if (sequence&1) return FALSE;
-    *status=InputStatus;
-    MemoryBarrier();
-    return sequence==Read32(InputStatusSequence);
+    AcquireSRWLockShared(&InputStatusLock);
+    *status=InputHistory[InputNumber%InputHistorySize];
+    ReleaseSRWLockShared(&InputStatusLock);
+    return TRUE;
+}
+BOOL TF_NextInputStatus(std::uint64_t after,NativeInputStatus* status,unsigned bytes) {
+    if (!Controller.data || !status || bytes!=sizeof(*status)) return FALSE;
+    AcquireSRWLockShared(&InputStatusLock);
+    const bool found=after<InputNumber;
+    if (found) {
+        const auto next=InputNumber-after>InputHistorySize ? InputNumber-InputHistorySize+1 : after+1;
+        *status=InputHistory[next%InputHistorySize];
+    }
+    ReleaseSRWLockShared(&InputStatusLock);
+    return found;
 }
 unsigned TF_IntentBytes() { return sizeof(NativeIntent); }
 BOOL TF_BeginFallback(unsigned serial) {
@@ -1193,7 +1337,7 @@ BOOL TF_TestShellLaunch(HWND source,HMONITOR target) {
 }
 BOOL TF_TestMouseInput(unsigned message,int x,int y) {
     if (!Controller.data || !(StartFlags&TF_TEST_MODE)
-        || (message!=WM_LBUTTONDOWN && message!=WM_LBUTTONUP)) return FALSE;
+        || (message!=WM_LBUTTONDOWN && message!=WM_LBUTTONUP && message!=WM_RBUTTONDOWN && message!=WM_RBUTTONUP)) return FALSE;
     HWND root{};
     { PhysicalDpi physical; root=GetAncestor(WindowFromPoint({x,y}),GA_ROOT); }
     DWORD pid{}; GetWindowThreadProcessId(root,&pid);
@@ -1202,10 +1346,12 @@ BOOL TF_TestMouseInput(unsigned message,int x,int y) {
     Mouse(HC_ACTION,message,reinterpret_cast<LPARAM>(&input));
     return TRUE;
 }
-BOOL TF_TestArmIdentity(const wchar_t* path,const wchar_t* appId,HMONITOR target) {
-    if (!TF_TestArm(path,nullptr,target) || !appId || wcslen(appId)>=256) return FALSE;
+BOOL TF_TestArmIdentity(const wchar_t* path,const wchar_t* appId,HMONITOR target,BOOL jumpList) {
+    if (!appId || wcslen(appId)>=256 || !Controller.data || !(StartFlags&TF_TEST_MODE) || !path || !target) return FALSE;
+    wchar_t own[1024]{}; GetModuleFileNameW(nullptr,own,1024);
+    if (_wcsicmp(path,own)!=0) return FALSE;
     NativeEntry entry{}; wcsncpy_s(entry.path,path,_TRUNCATE); wcsncpy_s(entry.appId,appId,_TRUNCATE);
-    entry.flags=TF_COLD_START|TF_REQUIRE_APP_ID;
+    entry.flags=TF_COLD_START|TF_REQUIRE_APP_ID|(jumpList?TF_JUMP_LIST:0);
     Arm(Controller.data,entry,target,nullptr,false); return TRUE;
 }
 void TF_SetPeekEnabled(BOOL enabled) { InterlockedExchange(&PeekEnabled,enabled?1:0); if (!enabled) QueuePeekHide(); }

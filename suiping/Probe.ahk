@@ -15,12 +15,22 @@ catch {
 }
 OnMessage(0x8050, RequestHit)
 SetTimer(CheckParent, 1000)
-DllCall("user32\PostMessageW", "ptr", ParentHwnd, "uint", 0x8051, "uptr", A_ScriptHwnd, "ptr", ProcessExist())
+NativeCacheEpoch := -1
 if A_Args.Length = 3 && A_Args[3] = "--native" {
-    SetTimer(EmitCache,750)
+    OnMessage(0x8056, RequestCache)
+    SetTimer(EmitCache,TaskbarScanRetention.CadenceMs)
     SetTimer(EmitHover,100)
-    EmitCache()
 }
+DllCall("user32\PostMessageW", "ptr", ParentHwnd, "uint", 0x8051, "uptr", A_ScriptHwnd, "ptr", ProcessExist())
+
+RequestCache(epoch,*) {
+    global NativeCacheEpoch
+    NativeCacheEpoch := epoch
+    SetTimer(RefreshCache,-1)
+}
+
+RefreshCache() => EmitCache()
+
 EmitHover() {
     global Uia
     static wasPreview := false, busy := false
@@ -56,28 +66,56 @@ EmitHover() {
 }
 
 EmitCache() {
-    global Uia
-    static busy := false
-    if busy
+    global Uia, NativeCacheEpoch
+    static busy := false, retention := TaskbarScanRetention(), sentEpoch := -1, sentRows := false
+    if busy || NativeCacheEpoch < 0
         return
-    busy := true
+    busy := true, epoch := NativeCacheEpoch
     try {
-        rows := ""
+        Desktop.Physical()
+        started := Desktop.Tick(), observations := [], scanned := 0
         bars := WinGetList("ahk_class Shell_TrayWnd")
         for hwnd in WinGetList("ahk_class Shell_SecondaryTrayWnd")
             bars.Push(hwnd)
         for hwnd in bars {
-            for item in Uia.Buttons(hwnd,true,false) {
-                if item.Id = "" || InStr(item.Id,"`t")
-                    continue
+            bounds := Desktop.Rect(hwnd), pid := Desktop.Pid(hwnd)
+            if !IsObject(bounds) || !pid
+                continue
+            try {
+                items := Uia.Buttons(hwnd,true,false)
+                scanned += 1
+            } catch {
+                items := []
+            }
+            currentBounds := Desktop.Rect(hwnd)
+            if !IsObject(currentBounds) || !TaskbarScanRetention.SameRect(bounds,currentBounds)
+                || Desktop.Pid(hwnd) != pid || !Desktop.IsTaskbar(Desktop.Class(hwnd))
+                continue
+            rows := ""
+            for item in items {
                 r := item.Rect
+                if item.Id = "" || StrLen(item.Id) >= 256 || InStr(item.Id,"`t") || r.W <= 0 || r.H <= 0
+                    continue
                 rows .= hwnd . "`t" . r.L . "`t" . r.T . "`t" . r.R . "`t" . r.B . "`t" . item.Id . "`n"
             }
+            observations.Push({Hwnd:hwnd,Pid:pid,Rect:currentBounds,At:Desktop.Tick(),Rows:rows})
         }
-        SendResult(rows,0x54424633)
+        if epoch != NativeCacheEpoch
+            return
+        rows := retention.Merge(epoch,observations,started)
+        ; When all providers fail, clear previously sent rows once the one-scan
+        ; retention expires. Further failures let the watchdog detect the stall.
+        if (scanned || !bars.Length || rows != "" || (sentEpoch = epoch && sentRows))
+            && SendResult(epoch . "`n" . rows,0x54424633) {
+            sentEpoch := epoch, sentRows := rows != ""
+        }
     } catch {
         ; A failed refresh must not make an old layout appear freshly verified.
-    } finally busy := false
+    } finally {
+        busy := false
+        if epoch != NativeCacheEpoch
+            SetTimer(RefreshCache,-1)
+    }
 }
 
 RequestHit(serial, point, *) {
@@ -107,8 +145,9 @@ SendResult(text, magic := 0x54424631) {
     NumPut("uint", data.Size, cds, A_PtrSize)
     NumPut("ptr", data.Ptr, cds, A_PtrSize * 2)
     ignored := 0
-    DllCall("user32\SendMessageTimeoutW", "ptr", ParentHwnd, "uint", 0x4A,
+    sent := DllCall("user32\SendMessageTimeoutW", "ptr", ParentHwnd, "uint", 0x4A,
         "uptr", A_ScriptHwnd, "ptr", cds, "uint", 3, "uint", 150, "ptr*", &ignored, "ptr")
+    return sent && ignored
 }
 CheckParent() {
     global ParentHwnd, ParentPid

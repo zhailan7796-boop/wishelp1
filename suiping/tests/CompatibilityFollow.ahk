@@ -80,6 +80,7 @@ class CompatibilityFixture extends NativeEngine {
         this.MoveResult := "requested", this.IntentReads := 0, this.CancelAtRead := 0
         this.ForegroundReads := 0, this.InterruptAtForeground := 0, this.InterruptKind := ""
         this.WindowSnapshot := 0
+        this.AppOrigin := {Pid:101,AppId:"Fixture.App"}
         this.TakeoverAllowed := true
         this.ReplaceAtRead := 0, this.ReplaceDuringCompare := false, this.ReplaceNativeOnlyDuringCompare := false
         this.CompareCritical := 0, this.MoveCritical := 0
@@ -103,6 +104,7 @@ class CompatibilityFixture extends NativeEngine {
     }
     CompatibilityTakeover(serial) => this.TakeoverAllowed && this.Valid && serial = this.Intent.Serial
     CompatibilitySnapshot(hwnd) => IsObject(this.WindowSnapshot) && this.WindowSnapshot.Hwnd = hwnd ? this.WindowSnapshot : 0
+    CompatibilityAppOrigin(hwnd) => this.AppOrigin
     CompatibilityMonitor(handle) => CompatibilityChecks.Monitor(handle)
     CompatibilitySchedule(enabled) {
         this.Scheduled := enabled
@@ -168,12 +170,20 @@ try {
     CompatibilityChecks.Assert(!fixture.BeginCompatibility(7,3) && !fixture.Scheduled,
         "A delayed message with a different monitor payload cannot start compatibility")
 
-    fixture := CompatibilityFixture(), fixture.Selected.Data.Pid := 202
+    fixture := CompatibilityFixture(), fixture.Selected.Data.Pid := 202, fixture.Selected.Data.AppId := "Fixture.App"
     fixture.BeginCompatibility(7,2)
     CompatibilityChecks.NoRequest(fixture,"A recycled HWND with a different PID is rejected")
     fixture := CompatibilityFixture(), fixture.Selected.Hwnd := 12
     fixture.BeginCompatibility(7,2)
     CompatibilityChecks.NoRequest(fixture,"A same-process window outside the warm snapshot is rejected")
+    fixture.Selected.Data.AppId := "Fixture.App"
+    CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1 && fixture.Requests[1].Hwnd = 12,
+        "An exact live AppID confirms a new foreground window absent from the taskbar snapshot")
+    fixture := CompatibilityFixture(), fixture.Selected.Hwnd := 12, fixture.Selected.Data.AppId := "Fixture.App"
+    fixture.Selected.Data.Path := A_Temp . "\other.exe"
+    fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"An unlisted window with the same AppID but a different known installation is rejected")
     fixture := CompatibilityFixture(false), fixture.Selected.Data.Path := "C:\Other\AutoHotkey64.exe"
     fixture.BeginCompatibility(7,2)
     CompatibilityChecks.NoRequest(fixture,"Cold identity requires the exact verified executable path")
@@ -325,6 +335,17 @@ try {
     CompatibilityChecks.Assert(!fixture.Scheduled && !fixture.Requests.Length && !fixture.CompatibilityMoves,
         "A selected window already on the destination is left in place and is not counted as a move")
 
+    fixture := CompatibilityFixture(), fixture.Intent.Before := 11
+    fixture.Intent.Candidates.Push({Hwnd:12,Pid:102})
+    fixture.Selected.Monitor := CompatibilityChecks.Monitor(2)
+    fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"The original group member cannot complete a pending selection")
+    CompatibilityChecks.Assert(fixture.Scheduled,"A group selection stays live while its previous foreground remains")
+    fixture.Selected := CompatibilityChecks.Window(12,102)
+    CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1 && fixture.Requests[1].Hwnd = 12,
+        "The group selection follows the window Windows actually activated")
+
     fixture := CompatibilityFixture(), fixture.BeginCompatibility(7,2)
     CompatibilityChecks.StopEngine := fixture
     stopCallback := CallbackCreate(ObjBindMethod(CompatibilityChecks,"NativeStop"),,1)
@@ -366,6 +387,11 @@ try {
     fixture.WindowSnapshot.Minimized := false, fixture.WindowSnapshot.Monitor := CompatibilityChecks.Monitor(2)
     fixture.Now += 50, fixture.CompatibilityTick()
     CompatibilityChecks.Assert(fixture.CompatibilityMoves = 1,"The rescued window is counted only after it is visibly restored on target")
+    fixture := CompatibilityFixture(), fixture.Intent.Before := 11
+    fixture.WindowSnapshot := fixture.Selected, fixture.WindowSnapshot.Minimized := true, fixture.Selected := 0
+    fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1 && fixture.Compatibility.Recovering,
+        "The same verified cross-screen rescue also works for x86 applications")
     fixture := CompatibilityFixture(), fixture.Intent.Flags := 17, fixture.Intent.Before := 11, fixture.Owner.BringActive := false
     fixture.WindowSnapshot := fixture.Selected, fixture.WindowSnapshot.Minimized := true, fixture.Selected := 0
     fixture.BeginCompatibility(7,2)
@@ -436,6 +462,65 @@ try {
     CompatibilityChecks.Assert(fixture.Requests.Length = 1,"A different application appearing after an explicit shell launch follows the source screen")
     fixture.Valid := false, fixture.CompatibilityTick()
     CompatibilityChecks.Assert(!fixture.Scheduled,"Any new input cancels the shell-launch backup")
+
+    for scenario in ["new same PID","new exact AppID","new owned dialog","clicked source","old foreground",
+        "visible sibling","visible other PID","unrelated PID","same PID different AppID","recycled origin"] {
+        fixture := CompatibilityFixture(), fixture.Intent.Flags := NativeEngine.AppLaunchFlag
+        fixture.Intent.Before := 31, fixture.Intent.Source := 30
+        fixture.Intent.Candidates := [{Hwnd:30,Pid:101},{Hwnd:12,Pid:101},{Hwnd:13,Pid:102}]
+        fixture.Selected := CompatibilityChecks.Window(11,101)
+        switch scenario {
+            case "new exact AppID": fixture.Selected.Data.Pid := 102, fixture.Selected.Data.AppId := "Fixture.App"
+            case "new owned dialog": fixture.Selected.Data.Pid := 102, fixture.Selected.Owner := 30
+            case "clicked source": fixture.Selected.Hwnd := 30
+            case "old foreground": fixture.Selected.Hwnd := 31
+            case "visible sibling": fixture.Selected.Hwnd := 12
+            case "visible other PID":
+                fixture.Selected.Hwnd := 13, fixture.Selected.Data.Pid := 102, fixture.Selected.Data.AppId := "Fixture.App"
+            case "unrelated PID": fixture.Selected.Data.Pid := 102
+            case "same PID different AppID": fixture.Selected.Data.AppId := "Other.App"
+            case "recycled origin":
+                fixture.AppOrigin.Pid := 103, fixture.Selected.Data.Pid := 102, fixture.Selected.Data.AppId := "Fixture.App"
+        }
+        CompatibilityChecks.Assert(fixture.BeginCompatibility(7,2) && !fixture.Owner.Messages.Length,
+            "A potential application click is silent while waiting")
+        CompatibilityChecks.Stable(fixture)
+        CompatibilityChecks.Assert(fixture.Requests.Length = (SubStr(scenario,1,3) = "new"),
+            "In-app launch selection: " . scenario)
+        if !fixture.Requests.Length {
+            fixture.Now := fixture.Intent.Expires, fixture.CompatibilityTick()
+            CompatibilityChecks.Assert(!fixture.Owner.Messages.Length && !fixture.Owner.Logs.Length,
+                "A normal application click expires without status or log noise")
+        }
+    }
+
+    fixture := CompatibilityFixture(), fixture.Intent.Flags := NativeEngine.JumpListFlag | 1
+    fixture.Intent.Before := 21, fixture.Intent.Source := 20
+    fixture.Selected := CompatibilityChecks.Window(12,101)
+    fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1 && fixture.Requests[1].Hwnd = 12,
+        "Opening a recent folder can follow a new window absent from the saved taskbar group")
+    for rejected in ["before","other app","other installation","shared executable without AppID"] {
+        fixture := CompatibilityFixture(), fixture.Intent.Flags := NativeEngine.JumpListFlag | 1
+        fixture.Selected.Data.AppId := "Fixture.App"
+        switch rejected {
+            case "before": fixture.Intent.Before := fixture.Selected.Hwnd
+            case "other app": fixture.Selected.Data.AppId := "Other.App"
+            case "other installation": fixture.Selected.Data.Path := A_Temp . "\other.exe"
+            case "shared executable without AppID": fixture.Intent.Flags |= 2, fixture.Selected.Data.AppId := ""
+        }
+        fixture.BeginCompatibility(7,2)
+        CompatibilityChecks.NoRequest(fixture,"Jump-list selection rejects " . rejected)
+    }
+    fixture := CompatibilityFixture(false), fixture.Intent.Flags := NativeEngine.JumpListFlag
+    fixture.Intent.Path := "", fixture.Selected.Data.AppId := fixture.Intent.Id
+    fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1,"A matching explicit AppID can verify the selected window without a known path")
+    fixture := CompatibilityFixture(false), fixture.Intent.Flags := NativeEngine.JumpListFlag | 1, fixture.Intent.NativeClaimed := 1
+    fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"An in-process jump-list claim is given time to finish")
+    fixture.Now += 500, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1,"The jump-list backup can recover an incomplete native move")
 
     candidates := [{Hwnd:1,Pid:101,Title:"Browser"},{Hwnd:2,Pid:102,Title:"Reader"}]
     hover := NativeEngine.HoverMatches(candidates,["Reader"])

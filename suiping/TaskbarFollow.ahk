@@ -67,7 +67,9 @@ class TaskbarFollow {
         this.DisableMoves := testOnly
         this.TestOnly := testOnly, this.BackgroundStart := backgroundStart, this.Panel := 0, this.TrayBuilt := false
         this.NativeMode := !testOnly && IniRead(this.Config,"General","Engine","native") = "native"
-        this.Native := 0, this.NativeRows := "", this.NativePublishing := false
+        this.Native := 0, this.NativeRows := 0, this.NativePublishing := false
+        this.NativeCacheEpoch := 0, this.NativeCacheReceivedAt := 0
+        this.NativePublishCallback := ObjBindMethod(this,"PublishNativeCache")
         this.NativeHoverRows := "hide", this.NativeHoverBusy := false
         this.FollowPeek := IniRead(this.Config,"General","FollowPeek","1") = "1"
         this.Started := false, this.MappingsReady := false, this.StartTick := Desktop.Tick()
@@ -212,9 +214,10 @@ class TaskbarFollow {
         }
         this.MappingsReady := true
         this.Log("identity ready; elapsed-ms=" . (Desktop.Tick() - started) . "; shortcuts=" . this.Identity.ShortcutCount)
-        if this.NativeMode
+        if this.NativeMode {
             this.ReportActivity("应用映射已加载，正在准备原生任务栏定位。")
-        else if IsObject(this.Pending)
+            this.PublishNativeCache()
+        } else if IsObject(this.Pending)
             this.ReportActivity("初始化完成，正在继续处理刚才的任务栏点击。")
         else
             this.ReportActivity("初始化完成。请在另一块屏幕的任务栏点击应用，观察这里的处理反馈。")
@@ -240,13 +243,35 @@ class TaskbarFollow {
         }
     }
     PublishNativeCache() {
-        if this.NativePublishing || !IsObject(this.Native)
+        if this.NativePublishing || !this.MappingsReady || !IsObject(this.Native) || !IsObject(this.NativeRows)
             return
         this.NativePublishing := true
-        try this.Native.Publish(this.NativeRows)
+        snapshot := this.NativeRows, this.NativeRows := 0
+        try this.Native.Publish(snapshot.Rows,snapshot.Epoch)
         catch as e
             this.Log("native cache error: " . e.Message . "; " . e.Extra . "; file=" . e.File . "; line=" . e.Line)
-        finally this.NativePublishing := false
+        finally {
+            this.NativePublishing := false
+            if IsObject(this.NativeRows)
+                SetTimer(this.NativePublishCallback,-1)
+        }
+    }
+    InvalidateNativeCache() {
+        ; Advance the epoch before clearing so an in-flight UIA scan or identity
+        ; lookup cannot publish taskbar geometry from the previous desktop layout.
+        criticalState := A_IsCritical
+        Critical "On"
+        try {
+            this.NativeCacheEpoch += 1, this.NativeRows := 0
+            if IsObject(this.Native)
+                this.Native.InvalidateCache()
+        } finally Critical criticalState
+    }
+    RequestNativeCache() {
+        if !this.HelperReady
+            return
+        this.NativeCacheReceivedAt := Desktop.Tick()
+        DllCall("user32\PostMessageW","ptr",this.HelperHwnd,"uint",0x8056,"uptr",this.NativeCacheEpoch,"ptr",0)
     }
     PublishNativeHover() {
         if this.NativeHoverBusy || !this.FollowPeek || !IsObject(this.Native)
@@ -302,18 +327,23 @@ class TaskbarFollow {
         this.HelperHandle := DllCall("kernel32\OpenProcess", "uint", 0x101001, "int", false, "uint", pid, "ptr")
     }
     StopHelper() {
-        if this.HelperHandle {
-            ; An owned process HANDLE, not a possibly recycled PID. Never terminate Explorer or an application.
-            if DllCall("kernel32\WaitForSingleObject", "ptr", this.HelperHandle, "uint", 0, "uint") = 0x102
-                DllCall("kernel32\TerminateProcess", "ptr", this.HelperHandle, "uint", 0)
-            DllCall("kernel32\WaitForSingleObject", "ptr", this.HelperHandle, "uint", 500, "uint")
-            DllCall("kernel32\CloseHandle", "ptr", this.HelperHandle)
-        }
+        handle := this.HelperHandle
         this.HelperHandle := 0, this.HelperPid := 0, this.HelperHwnd := 0, this.HelperReady := false
+        if this.NativeMode
+            this.InvalidateNativeCache()
+        if handle {
+            ; An owned process HANDLE, not a possibly recycled PID. Never terminate Explorer or an application.
+            if DllCall("kernel32\WaitForSingleObject", "ptr", handle, "uint", 0, "uint") = 0x102
+                DllCall("kernel32\TerminateProcess", "ptr", handle, "uint", 0)
+            DllCall("kernel32\WaitForSingleObject", "ptr", handle, "uint", 500, "uint")
+            DllCall("kernel32\CloseHandle", "ptr", handle)
+        }
     }
     HelperHello(childHwnd, pid, *) {
         if pid = this.HelperPid && Desktop.Pid(childHwnd) = pid {
             this.HelperHwnd := childHwnd, this.HelperReady := true
+            if this.NativeMode
+                this.RequestNativeCache()
             this.Log("UIA helper ready")
             this.UpdateTray()
             if !this.TestMode
@@ -342,8 +372,14 @@ class TaskbarFollow {
             return 1
         }
         if magic = 0x54424633 {
-            this.NativeRows := StrGet(ptr,bytes//2-1)
-            SetTimer(ObjBindMethod(this,"PublishNativeCache"),-1)
+            text := StrGet(ptr,bytes//2-1), splitAt := InStr(text,"`n")
+            epoch := this.NativeCacheEpoch
+            if !splitAt || SubStr(text,1,splitAt-1) != String(epoch)
+                return 0
+            this.NativeCacheReceivedAt := Desktop.Tick()
+            this.NativeRows := {Rows:SubStr(text,splitAt+1),Epoch:epoch}
+            if this.MappingsReady && !this.NativePublishing
+                SetTimer(this.NativePublishCallback,-1)
             return 1
         }
         this.ReplyCount += 1
@@ -437,8 +473,11 @@ class TaskbarFollow {
         this.Generation += 1, this.CoolUntil := Desktop.Tick() + 1800
         this.Cancel("display/power/taskbar-change")
         this.Identity.Cache.Clear()
-        if IsObject(this.Native)
+        if IsObject(this.Native) {
             this.Native.Cancel(1800)
+            this.InvalidateNativeCache()
+            this.RequestNativeCache()
+        }
     }
     Cancel(reason := "", expected := 0) {
         if IsObject(this.Native)
@@ -648,13 +687,15 @@ class TaskbarFollow {
     }
     Watchdog() {
         now := Desktop.Tick()
-        if this.NativeMode && IsObject(this.Native) && this.HelperReady && this.Native.CacheCount && this.Native.CacheAge > 5000 {
-            this.StopHelper(), this.Cancel("helper-exited"), this.HelperRestartAt := now + 500
+        if this.NativeMode && this.HelperReady && now - this.NativeCacheReceivedAt > 5000 {
+            this.StopHelper(), this.HelperRestartAt := now + 500
             this.Log("native taskbar cache stale; reconnecting UIA helper")
             this.UpdateTray()
         }
         if this.HelperHandle && DllCall("kernel32\WaitForSingleObject", "ptr", this.HelperHandle, "uint", 0, "uint") != 0x102 {
-            this.StopHelper(), this.Cancel("helper-exited"), this.HelperRestartAt := now + 1000
+            this.StopHelper(), this.HelperRestartAt := now + 1000
+            if !this.NativeMode
+                this.Cancel("helper-exited")
             this.UpdateTray()
         }
         if !this.HelperReady && this.HelperHandle && now - this.HelperStarted > 3500 {

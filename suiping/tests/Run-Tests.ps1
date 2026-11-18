@@ -15,6 +15,7 @@ $cases = @(
     @{Name='background-instance'; Script='tests\BackgroundInstance.ahk'; Args=''},
     @{Name='uia-smoke'; Script='tests\Smoke.ahk'; Args=''},
     @{Name='uia-cache'; Script='tests\UiaCache.ahk'; Args=''},
+    @{Name='native-cache-startup'; Script='tests\NativeCacheStartup.ahk'; Args=''},
     @{Name='window-move'; Script='tests\WindowMove.ahk'; Args=''},
     @{Name='helper-ipc'; Script='TaskbarFollow.ahk'; Args='--lifecycle-test'},
     @{Name='startup-hooks'; Script='TaskbarFollow.ahk'; Args='--startup-test'},
