@@ -10,6 +10,7 @@ $cases = @(
     @{Name='identity-cache'; Script='tests\IdentityCache.ahk'; Args=''},
     @{Name='app-identity'; Script='tests\AppIdentity.ahk'; Args=''},
     @{Name='compatibility-follow'; Script='tests\CompatibilityFollow.ahk'; Args=''},
+    @{Name='link-follow'; Script='tests\LinkFollow.ahk'; Args=''},
     @{Name='native-shutdown'; Script='tests\NativeShutdown.ahk'; Args=''},
     @{Name='display-autostart'; Script='tests\DisplayAutoStart.ahk'; Args=''},
     @{Name='background-instance'; Script='tests\BackgroundInstance.ahk'; Args=''},

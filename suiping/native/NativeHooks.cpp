@@ -59,7 +59,11 @@ HDESK WorkerDesktop{};
 HWND ControllerOwner{};
 HHOOK CbtHook{}, CallHook{}, MouseHook{}, KeyboardHook{};
 constexpr UINT PeekCommand=WM_APP+71;
+constexpr UINT LaunchCommand=WM_APP+72;
 constexpr UINT OwnWindowCommand=0x8054, CompatibilityCommand=0x8055;
+// Shell/desktop clicks keep their short window. Applications often fetch data
+// or start a helper process before showing the window a click asked for.
+constexpr unsigned ShellLaunchMs=2000, AppLaunchMs=5000;
 PeekPreview PeekUi;
 volatile LONG PeekEnabled=1, PeekGeneration=0;
 struct PeekRequest { HWND source,popup; DWORD pid; POINT point; LONG generation; };
@@ -638,7 +642,9 @@ void Arm(Shared* shared,const NativeEntry& entry,HMONITOR monitor,HWND before,bo
     Transaction tx{}; tx.entry=entry; tx.monitor=Id(monitor); tx.before=Id(before); tx.source=Id(source);
     tx.target.cbSize=sizeof(tx.target);
     if (!GetMonitorInfoW(monitor,&tx.target)) return;
-    tx.released=Now(); tx.expires=tx.released+((entry.flags&(TF_SHELL_LAUNCH|TF_APP_LAUNCH))?2000:(preview ? 1800 : static_cast<unsigned>(Read32(shared->timeoutMs)))); tx.preview=preview?1u:0u;
+    const unsigned lifetime=(entry.flags&TF_APP_LAUNCH) ? AppLaunchMs : ((entry.flags&TF_SHELL_LAUNCH) ? ShellLaunchMs
+        : (preview ? 1800u : static_cast<unsigned>(Read32(shared->timeoutMs))));
+    tx.released=Now(); tx.expires=tx.released+lifetime; tx.preview=preview?1u:0u;
     tx.serial=static_cast<unsigned>(InterlockedIncrement(&shared->serial));
     tx.epoch=static_cast<unsigned>(InterlockedIncrement(&shared->inputEpoch));
     InterlockedIncrement(&shared->txSequence);
@@ -647,7 +653,9 @@ void Arm(Shared* shared,const NativeEntry& entry,HMONITOR monitor,HWND before,bo
     InterlockedExchange64(&shared->fallback,static_cast<LONG64>(static_cast<std::uint64_t>(tx.serial)<<32));
     MemoryBarrier(); InterlockedIncrement(&shared->txSequence);
     InterlockedIncrement64(&shared->armed);
-    if (!(entry.flags&TF_APP_LAUNCH)) Event(shared,TF_ARMED,nullptr,&tx);
+    // Ordinary application clicks and link requests are not taskbar clicks;
+    // the controller reports those itself once a window actually appears.
+    if (!(entry.flags&(TF_APP_LAUNCH|TF_LINK_LAUNCH))) Event(shared,TF_ARMED,nullptr,&tx);
 }
 enum class ClickKind { Taskbar, Preview, ShellLaunch, JumpList, AppLaunch };
 struct ClickState {
@@ -739,8 +747,14 @@ bool VisibleAppSurface(HWND hwnd) {
     const auto ex=GetWindowLongPtrW(hwnd,GWL_EXSTYLE);
     return !(ex&(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE)) && !(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_CHILD);
 }
+struct AppCapture {
+    NativeEntry* entry;
+    NativeCandidate others[TF_MAX_WINDOWS];
+    unsigned otherCount;
+};
 BOOL CALLBACK CaptureVisibleApp(HWND hwnd,LPARAM parameter) {
-    auto& entry=*reinterpret_cast<NativeEntry*>(parameter);
+    auto& capture=*reinterpret_cast<AppCapture*>(parameter);
+    NativeEntry& entry=*capture.entry;
     if (Id(hwnd)==entry.windows[0].hwnd || !VisibleAppSurface(hwnd)) return TRUE;
     const HWND owner=GetWindow(hwnd,GW_OWNER);
     if (owner && Id(owner)!=entry.windows[0].hwnd && !(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_APPWINDOW)) return TRUE;
@@ -750,8 +764,14 @@ BOOL CALLBACK CaptureVisibleApp(HWND hwnd,LPARAM parameter) {
         if (wcscmp(cls,shellClass)==0) return TRUE;
     DWORD pid{};
     if (!GetWindowThreadProcessId(hwnd,&pid) || !pid) return TRUE;
-    if (entry.count==TF_MAX_WINDOWS) return FALSE;
-    entry.windows[entry.count++]={Id(hwnd),pid,0};
+    // A busy desktop can have more visible windows than the fixed ABI holds.
+    // Keep the clicked process first, then other windows while space lasts,
+    // instead of silently disabling every in-app launch on that desktop.
+    if (pid==entry.windows[0].pid) {
+        if (entry.count<TF_MAX_WINDOWS) entry.windows[entry.count++]={Id(hwnd),pid,0};
+    } else if (capture.otherCount<TF_MAX_WINDOWS) {
+        capture.others[capture.otherCount++]={Id(hwnd),pid,0};
+    }
     return TRUE;
 }
 bool CaptureAppLaunch(Shared* shared,HWND source,NativeEntry& entry) {
@@ -763,7 +783,11 @@ bool CaptureAppLaunch(Shared* shared,HWND source,NativeEntry& entry) {
     // The first pair identifies the click source. The others exclude already
     // visible windows, including minimized ones and siblings in other processes.
     entry.windows[entry.count++]={Id(source),pid,0};
-    return EnumWindows(CaptureVisibleApp,reinterpret_cast<LPARAM>(&entry))!=FALSE;
+    AppCapture capture{&entry,{},0};
+    EnumWindows(CaptureVisibleApp,reinterpret_cast<LPARAM>(&capture));
+    for (unsigned i=0;i<capture.otherCount && entry.count<TF_MAX_WINDOWS;++i)
+        entry.windows[entry.count++]=capture.others[i];
+    return true;
 }
 bool AppReleaseMatches(HWND root,POINT point) {
     const auto sourcePid=ClickApp.windows[0].pid;
@@ -826,6 +850,38 @@ bool ReleaseEntry(Shared* shared,const NativeEntry& entry,HMONITOR target,HWND b
         Cancel(shared); Event(shared,TF_UNSUPPORTED); return false;
     }
     return true;
+}
+// A link opened by another process has no click on this input thread. The
+// request is executed by that thread so the transaction keeps a single writer.
+struct LaunchRequest {
+    NativeEntry entry{};
+    HMONITOR monitor{};
+    HANDLE done{};
+    volatile LONG references{2};
+    volatile LONG serial{};
+    volatile LONG state{}; // 0 pending, 1 taken by the input thread, 2 abandoned by its caller
+};
+void ReleaseLaunch(LaunchRequest* request) {
+    if (InterlockedDecrement(&request->references)==0) {
+        if (request->done) CloseHandle(request->done);
+        delete request;
+    }
+}
+void ArmLaunch(LaunchRequest* request) {
+    Shared* shared=Controller.data;
+    // A caller that already gave up must not receive a late, unseen transaction.
+    if (InterlockedCompareExchange(&request->state,1,0)==0
+        && Live(shared) && Now()>=static_cast<std::uint64_t>(Read64(shared->coolUntil))) {
+        Arm(shared,request->entry,request->monitor,GetForegroundWindow(),false);
+        Transaction tx;
+        if (Snapshot(shared,tx) && (tx.entry.flags&TF_LINK_LAUNCH)) {
+            if (ControllerOwner && PostMessageW(ControllerOwner,CompatibilityCommand,
+                static_cast<WPARAM>(tx.serial),reinterpret_cast<LPARAM>(request->monitor)))
+                InterlockedExchange(&request->serial,static_cast<LONG>(tx.serial));
+            else Cancel(shared);
+        }
+    }
+    SetEvent(request->done);
 }
 bool Modified() {
     for (int key : {VK_SHIFT,VK_CONTROL,VK_MENU,VK_LWIN,VK_RWIN}) if (GetAsyncKeyState(key)&0x8000) return true;
@@ -1054,8 +1110,11 @@ DWORD RunInputThread() {
                 const HMONITOR hoverMonitor=MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST);
                 const bool matched=FindHoverEntry(Controller.data,request->source,request->pid,hoverMonitor,hovered);
                 Transaction active;
+                // An ordinary in-app click only waits for a new window; it must
+                // not suppress hover previews for its whole waiting period.
+                const bool positioning=Snapshot(Controller.data,active) && !(active.entry.flags&TF_APP_LAUNCH);
                 if (Read32(PeekEnabled) && request->generation==Read32(PeekGeneration) && Live(Controller.data)
-                    && root==request->popup && Preview(root) && matched && !Click.valid && !Snapshot(Controller.data,active)
+                    && root==request->popup && Preview(root) && matched && !Click.valid && !positioning
                     && abs(point.x-request->point.x)<=8 && abs(point.y-request->point.y)<=8
                     && !(GetAsyncKeyState(VK_LBUTTON)&0x8000) && !Modified()
                     && MonitorFromWindow(request->source,MONITOR_DEFAULTTONEAREST)!=MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST)) {
@@ -1072,11 +1131,22 @@ DWORD RunInputThread() {
             }
             continue;
         }
+        if (message.message==LaunchCommand) {
+            if (auto* request=reinterpret_cast<LaunchRequest*>(message.lParam)) {
+                ArmLaunch(request); ReleaseLaunch(request);
+            }
+            continue;
+        }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
     PeekUi.Shutdown();
     while (PeekMessageW(&message,nullptr,PeekCommand,PeekCommand,PM_REMOVE))
         if (message.wParam) delete reinterpret_cast<PeekRequest*>(message.lParam);
+    while (PeekMessageW(&message,nullptr,LaunchCommand,LaunchCommand,PM_REMOVE)) {
+        if (auto* request=reinterpret_cast<LaunchRequest*>(message.lParam)) {
+            SetEvent(request->done); ReleaseLaunch(request);
+        }
+    }
     ShutdownError=ReleaseInputHooks();
     return 0;
 }
@@ -1301,6 +1371,33 @@ BOOL TF_CancelCompatibility(unsigned serial) {
     Transaction tx;
     return Snapshot(Controller.data,tx) && tx.serial==serial && (tx.entry.flags&TF_AFTER_SHOW)
         && CancelTransaction(Controller.data,tx);
+}
+unsigned TF_ArmLaunch(const wchar_t* path,HMONITOR target) {
+    Shared* shared=Controller.data;
+    if (!shared || !WorkerId || !path || !target || !Live(shared)) return 0;
+    const size_t length=wcsnlen(path,1024);
+    MONITORINFO info{sizeof(info)};
+    if (!length || length>=1024 || !GetMonitorInfoW(target,&info)) return 0;
+    auto* request=new(std::nothrow) LaunchRequest{};
+    if (!request) return 0;
+    request->done=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    if (!request->done) { delete request; return 0; }
+    // A cold-start style entry: no cached HWND, one exact executable path. The
+    // creation hook places only that program's next new top-level window.
+    request->entry.flags=TF_COLD_START|TF_LINK_LAUNCH;
+    wcsncpy_s(request->entry.path,path,_TRUNCATE);
+    request->monitor=target;
+    if (!PostThreadMessageW(WorkerId,LaunchCommand,0,reinterpret_cast<LPARAM>(request))) {
+        CloseHandle(request->done); delete request; return 0;
+    }
+    // Bounded: the input thread never waits on this caller. If it has not yet
+    // taken the request, abandon it atomically; once taken, Arm is microseconds.
+    if (WaitForSingleObject(request->done,500)!=WAIT_OBJECT_0
+        && InterlockedCompareExchange(&request->state,2,0)!=0)
+        WaitForSingleObject(request->done,500);
+    const unsigned serial=static_cast<unsigned>(InterlockedCompareExchange(&request->serial,0,0));
+    ReleaseLaunch(request);
+    return serial;
 }
 BOOL TF_TestReleaseEntry(const NativeEntry* entry,HMONITOR target,BOOL preview) {
     if (!Controller.data || !(StartFlags&TF_TEST_MODE) || !entry || !target || entry->count>TF_MAX_WINDOWS

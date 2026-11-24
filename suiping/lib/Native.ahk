@@ -121,6 +121,61 @@ class Desktop {
         p := this.Placement(hwnd)
         return IsObject(p) && ScreenRect.FromBuffer(p, 28).W >= 160 && ScreenRect.FromBuffer(p, 28).H >= 100
     }
+    ; A window that a click inside an application has just brought to the
+    ; foreground. Players and viewers built on Qt (class Qt5QWindowTool...) or
+    ; custom frameworks often carry the tool-window style and an owner window
+    ; of their own process, which Eligible() rejects. Used only for in-app
+    ; launches; returns "" when the window may follow, otherwise the reason.
+    static LaunchedWindowRefusal(hwnd, launchSource := 0) {
+        if this.Eligible(hwnd, launchSource)
+            return ""
+        if !hwnd || !DllCall("user32\IsWindow", "ptr", hwnd) || this.IsShell(hwnd)
+            return "gone-or-shell"
+        if !DllCall("user32\IsWindowVisible", "ptr", hwnd) || !DllCall("user32\IsWindowEnabled", "ptr", hwnd)
+            return "hidden-or-disabled"
+        ex := DllCall("user32\GetWindowLongPtrW", "ptr", hwnd, "int", -20, "ptr")
+        style := DllCall("user32\GetWindowLongPtrW", "ptr", hwnd, "int", -16, "ptr")
+        if (ex & 0x08000000) || (style & 0x40000000)
+            return "no-activate-or-child"
+        className := this.Class(hwnd)
+        if className = "#32768" || InStr(className, "ToolTip") || InStr(className, "Popup")
+            return "menu-or-tooltip"
+        owner := this.Owner(hwnd)
+        if owner && owner != launchSource {
+            ownerPid := this.Pid(owner), pid := this.Pid(hwnd)
+            if ownerPid != pid && (!launchSource || ownerPid != this.Pid(launchSource)) {
+                ownerPath := this.ProcessPath(ownerPid)
+                if ownerPath = "" || ownerPath != this.ProcessPath(pid)
+                    return "owned-by-other-process"
+            }
+        }
+        monitor := this.MonitorOf(hwnd), rect := this.Rect(hwnd)
+        if IsObject(monitor) && IsObject(rect) && !(style & 0x00C00000)
+            && rect.L <= monitor.Bounds.L && rect.T <= monitor.Bounds.T
+            && rect.R >= monitor.Bounds.R && rect.B >= monitor.Bounds.B
+            return "full-screen"
+        cloaked := 0
+        DllCall("dwmapi\DwmGetWindowAttribute", "ptr", hwnd, "uint", 14, "uint*", &cloaked, "uint", 4)
+        if cloaked || DllCall("user32\IsHungAppWindow", "ptr", hwnd)
+            return "cloaked-or-hung"
+        p := this.Placement(hwnd)
+        if !IsObject(p) || ScreenRect.FromBuffer(p, 28).W < 240 || ScreenRect.FromBuffer(p, 28).H < 160
+            return "too-small"
+        return ""
+    }
+    static LaunchedWindowEligible(hwnd, launchSource := 0) => this.LaunchedWindowRefusal(hwnd, launchSource) = ""
+    static ProcessPath(pid) {
+        if !pid
+            return ""
+        process := DllCall("kernel32\OpenProcess", "uint", 0x1000, "int", false, "uint", pid, "ptr")
+        if !process
+            return ""
+        try {
+            chars := 32768, b := Buffer(chars * 2, 0)
+            return DllCall("kernel32\QueryFullProcessImageNameW", "ptr", process, "uint", 0, "ptr", b, "uint*", &chars)
+                ? StrLower(StrGet(b, chars)) : ""
+        } finally DllCall("kernel32\CloseHandle", "ptr", process)
+    }
     static Placement(hwnd) {
         p := Buffer(44, 0)
         NumPut("uint", 44, p)
@@ -671,11 +726,25 @@ class WindowMover {
 ; SetWindowPlacement calls can report success before the owning UI thread has
 ; applied them. Observe each state before submitting the next distinct stage.
 ; This object owns no timers: a cancelled click cannot leave a delayed mover.
+;
+; direct: move a visible window in place (SetWindowPos), never minimizing it.
+; Used for windows without their own taskbar button (see NoTaskbarButton):
+; once minimized the user has no button to bring them back, and some programs
+; hide such a window the moment it is minimized (芒果TV's Qt player did exactly
+; that: it flashed and vanished, 2026-11-23 14:00).
 class WindowMoveOperation {
-    __New(hwnd,target,restoreMinimized := false) {
+    __New(hwnd,target,restoreMinimized := false,direct := false) {
         this.Hwnd := hwnd, this.Pid := Desktop.Pid(hwnd), this.Target := target
         this.RestoreMinimized := restoreMinimized, this.Phase := "new"
-        this.WasMin := false, this.WasMax := false
+        this.WasMin := false, this.WasMax := false, this.Direct := !!direct
+    }
+    ; Tool windows and owned windows get no taskbar button unless they ask for
+    ; one with WS_EX_APPWINDOW.
+    static NoTaskbarButton(hwnd) {
+        ex := DllCall("user32\GetWindowLongPtrW","ptr",hwnd,"int",-20,"ptr")
+        if ex & 0x40000 ; WS_EX_APPWINDOW
+            return false
+        return !!(ex & 0x80) || !!Desktop.Owner(hwnd) ; WS_EX_TOOLWINDOW, owned
     }
     Start() {
         Desktop.Physical()
@@ -691,12 +760,19 @@ class WindowMoveOperation {
         if this.WasMin && !this.RestoreMinimized
             return "minimized"
         this.WasMax := NumGet(placement,8,"uint")=3 || (this.WasMin && (NumGet(placement,4,"uint") & 2))
+        ; WINDOWPLACEMENT is in workspace coordinates, except for tool windows
+        ; (WS_EX_TOOLWINDOW), whose placement uses plain screen coordinates.
+        tool := !!(DllCall("user32\GetWindowLongPtrW","ptr",this.Hwnd,"int",-20,"ptr") & 0x80)
+        stored := ScreenRect.FromBuffer(placement,28)
         normal := this.WasMax || this.WasMin
-            ? Geometry.FromWorkspace(ScreenRect.FromBuffer(placement,28),source) : Desktop.Rect(this.Hwnd)
+            ? (tool ? stored : Geometry.FromWorkspace(stored,source)) : Desktop.Rect(this.Hwnd)
         if !IsObject(normal)
             return "rect-failed"
         this.Placement := placement
-        this.Normal := Geometry.ToWorkspace(Geometry.Map(normal,source.Work,target.Work),target)
+        mapped := Geometry.Map(normal,source.Work,target.Work)
+        this.Normal := tool ? mapped : Geometry.ToWorkspace(mapped,target)
+        if this.Direct && !this.WasMin
+            return this.StartDirect(mapped)
         NumPut("uint",4 | (this.WasMax ? 2 : 0),placement,4)
         NumPut("int",-1,"int",-1,placement,20)
         if this.WasMin
@@ -705,6 +781,26 @@ class WindowMoveOperation {
         this.Phase := this.WasMin ? "placing" : "minimizing"
         return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",placement)
             ? "requested" : "minimize-placement-failed:" A_LastError
+    }
+    ; Visible window, no minimize. Normal: one asynchronous SetWindowPos to the
+    ; mapped screen rectangle (no activation or z-order change; NOCOPYBITS so the
+    ; window repaints on the new screen). Maximized: restore onto the target in
+    ; place, then maximize there once it has arrived (see Advance).
+    StartDirect(mapped) {
+        if this.WasMax {
+            this.Normal.Write(this.Placement,28)
+            NumPut("uint",4,this.Placement,4) ; WPF_ASYNCWINDOWPLACEMENT
+            NumPut("int",-1,"int",-1,this.Placement,20) ; let Windows place the maximized window on the target
+            NumPut("uint",4,this.Placement,8) ; SW_SHOWNOACTIVATE: restore, no minimize
+            this.Phase := "unmaximizing"
+            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
+                ? "requested" : "direct-placement-failed:" A_LastError
+        }
+        this.Phase := "restoring" ; Advance's final check confirms the arrival
+        ; SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS
+        return DllCall("user32\SetWindowPos","ptr",this.Hwnd,"ptr",0,"int",mapped.L,"int",mapped.T,
+            "int",mapped.W,"int",mapped.H,"uint",0x4714)
+            ? "requested" : "direct-move-failed:" A_LastError
     }
     Advance() {
         Desktop.Physical()
@@ -717,6 +813,14 @@ class WindowMoveOperation {
         if !Desktop.Unchanged(this.Target,Desktop.Monitor(this.Target.Handle))
             return "monitor-changed"
         minimized := Desktop.IsMin(this.Hwnd)
+        if this.Phase = "unmaximizing" {
+            if minimized || !Desktop.SameMonitor(Desktop.MonitorOf(this.Hwnd),this.Target)
+                return "waiting"
+            NumPut("uint",3,this.Placement,8) ; SW_SHOWMAXIMIZED, now on the target screen
+            this.Phase := "restoring"
+            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
+                ? "waiting" : "maximize-placement-failed:" A_LastError
+        }
         if this.Phase = "minimizing" {
             if !minimized
                 return "waiting"

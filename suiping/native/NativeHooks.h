@@ -12,7 +12,9 @@ constexpr unsigned TF_VERIFIED_FOLLOW = 16; // bounded backup for any verified t
 constexpr unsigned TF_SHELL_LAUNCH = 32; // new foreground window from an explicit shell/menu click
 constexpr unsigned TF_JUMP_LIST = 64; // activate the app selected through its taskbar jump list
 constexpr unsigned TF_APP_LAUNCH = 128; // a newly shown window associated with a clicked application
-constexpr unsigned TF_AFTER_SHOW = TF_COMPATIBILITY | TF_PACKAGED_FOLLOW | TF_VERIFIED_FOLLOW | TF_SHELL_LAUNCH | TF_JUMP_LIST | TF_APP_LAUNCH;
+constexpr unsigned TF_LINK_LAUNCH = 256; // a browser window requested by the 随屏链接 URL handler
+constexpr unsigned TF_AFTER_SHOW = TF_COMPATIBILITY | TF_PACKAGED_FOLLOW | TF_VERIFIED_FOLLOW | TF_SHELL_LAUNCH | TF_JUMP_LIST
+    | TF_APP_LAUNCH | TF_LINK_LAUNCH;
 constexpr unsigned TF_TEST_MODE = 1;
 struct NativeCandidate { std::uint64_t hwnd; std::uint32_t pid, reserved; };
 struct alignas(8) NativeEntry {
@@ -76,6 +78,10 @@ TF_API unsigned TF_IntentBytes();
 TF_API BOOL TF_BeginFallback(unsigned serial);
 // A stale compatibility callback cannot cancel a newer click transaction.
 TF_API BOOL TF_CancelCompatibility(unsigned serial);
+// Arms the next new window of one exact executable for a target monitor, on the
+// input thread, for a link the URL handler is about to open. Returns its serial
+// (0 if not armed). New input, pause, display changes and expiry still cancel it.
+TF_API unsigned TF_ArmLaunch(const wchar_t* path, HMONITOR target);
 // Test mode installs no input hooks and can arm only the test executable's path.
 TF_API BOOL TF_TestArm(const wchar_t* path, HWND window, HMONITOR target);
 TF_API BOOL TF_TestArmIdentity(const wchar_t* path, const wchar_t* appId, HMONITOR target, BOOL jumpList);

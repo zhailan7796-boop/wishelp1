@@ -80,7 +80,9 @@ class CompatibilityFixture extends NativeEngine {
         this.MoveResult := "requested", this.IntentReads := 0, this.CancelAtRead := 0
         this.ForegroundReads := 0, this.InterruptAtForeground := 0, this.InterruptKind := ""
         this.WindowSnapshot := 0
-        this.AppOrigin := {Pid:101,AppId:"Fixture.App"}
+        SplitPath(A_AhkPath,&exe)
+        this.AppOrigin := {Pid:101,AppId:"Fixture.App",Path:A_AhkPath,Exe:exe}
+        this.ProcessTable := Map()
         this.TakeoverAllowed := true
         this.ReplaceAtRead := 0, this.ReplaceDuringCompare := false, this.ReplaceNativeOnlyDuringCompare := false
         this.CompareCritical := 0, this.MoveCritical := 0
@@ -105,6 +107,7 @@ class CompatibilityFixture extends NativeEngine {
     CompatibilityTakeover(serial) => this.TakeoverAllowed && this.Valid && serial = this.Intent.Serial
     CompatibilitySnapshot(hwnd) => IsObject(this.WindowSnapshot) && this.WindowSnapshot.Hwnd = hwnd ? this.WindowSnapshot : 0
     CompatibilityAppOrigin(hwnd) => this.AppOrigin
+    CompatibilityProcessInfo(pid) => this.ProcessTable.Has(pid) ? this.ProcessTable[pid] : 0
     CompatibilityMonitor(handle) => CompatibilityChecks.Monitor(handle)
     CompatibilitySchedule(enabled) {
         this.Scheduled := enabled
@@ -463,8 +466,10 @@ try {
     fixture.Valid := false, fixture.CompatibilityTick()
     CompatibilityChecks.Assert(!fixture.Scheduled,"Any new input cancels the shell-launch backup")
 
-    for scenario in ["new same PID","new exact AppID","new owned dialog","clicked source","old foreground",
-        "visible sibling","visible other PID","unrelated PID","same PID different AppID","recycled origin"] {
+    playerPath := "D:\Apps\Fixture\Player.exe"
+    for scenario in ["new same PID","new exact AppID","new owned dialog","new same program image","new child process",
+        "clicked source","old foreground","visible sibling","visible other PID","unrelated PID","same PID different AppID",
+        "recycled origin","unrelated program","recycled parent PID","shared host image"] {
         fixture := CompatibilityFixture(), fixture.Intent.Flags := NativeEngine.AppLaunchFlag
         fixture.Intent.Before := 31, fixture.Intent.Source := 30
         fixture.Intent.Candidates := [{Hwnd:30,Pid:101},{Hwnd:12,Pid:101},{Hwnd:13,Pid:102}]
@@ -472,6 +477,13 @@ try {
         switch scenario {
             case "new exact AppID": fixture.Selected.Data.Pid := 102, fixture.Selected.Data.AppId := "Fixture.App"
             case "new owned dialog": fixture.Selected.Data.Pid := 102, fixture.Selected.Owner := 30
+            case "new same program image":
+                ; e.g. a video client showing its player from a second copy of its own executable
+                fixture.AppOrigin.AppId := "", fixture.AppOrigin.Path := playerPath
+                fixture.Selected.Data.Pid := 102, fixture.Selected.Data.Path := playerPath
+            case "new child process":
+                fixture.Selected.Data.Pid := 102, fixture.Selected.Data.Path := "D:\Apps\Fixture\Helper.exe"
+                fixture.ProcessTable[102] := {Parent:101,Created:200}, fixture.ProcessTable[101] := {Parent:4,Created:100}
             case "clicked source": fixture.Selected.Hwnd := 30
             case "old foreground": fixture.Selected.Hwnd := 31
             case "visible sibling": fixture.Selected.Hwnd := 12
@@ -481,6 +493,14 @@ try {
             case "same PID different AppID": fixture.Selected.Data.AppId := "Other.App"
             case "recycled origin":
                 fixture.AppOrigin.Pid := 103, fixture.Selected.Data.Pid := 102, fixture.Selected.Data.AppId := "Fixture.App"
+            case "unrelated program":
+                fixture.Selected.Data.Pid := 102, fixture.Selected.Data.Path := "D:\Apps\Other\Other.exe"
+            case "recycled parent PID":
+                ; PID 101 was reused by a process newer than the window's process.
+                fixture.Selected.Data.Pid := 102, fixture.Selected.Data.Path := "D:\Apps\Other\Other.exe"
+                fixture.ProcessTable[102] := {Parent:101,Created:200}, fixture.ProcessTable[101] := {Parent:4,Created:300}
+            case "shared host image":
+                fixture.AppOrigin.AppId := "", fixture.Selected.Data.Pid := 102
         }
         CompatibilityChecks.Assert(fixture.BeginCompatibility(7,2) && !fixture.Owner.Messages.Length,
             "A potential application click is silent while waiting")
@@ -489,10 +509,40 @@ try {
             "In-app launch selection: " . scenario)
         if !fixture.Requests.Length {
             fixture.Now := fixture.Intent.Expires, fixture.CompatibilityTick()
-            CompatibilityChecks.Assert(!fixture.Owner.Messages.Length && !fixture.Owner.Logs.Length,
-                "A normal application click expires without status or log noise")
+            noticed := NativeEngine.NewAppWindow(fixture.Intent,fixture.Selected.Hwnd,fixture.Selected.Data.Pid)
+            CompatibilityChecks.Assert(!fixture.Owner.Messages.Length && fixture.Owner.Logs.Length = (noticed ? 1 : 0)
+                && (!noticed || InStr(fixture.Owner.Logs[1],"app launch unmatched-window")),
+                "An application click stays silent; only a rejected new window is logged once: " . scenario)
         }
     }
+    CompatibilityChecks.Assert(NativeEngine.SharedHost(A_WinDir . "\System32\rundll32.exe")
+        && NativeEngine.SharedHost("C:\Tools\AutoHotkey64.exe")
+        && NativeEngine.SharedHost("C:\Program Files\Google\Chrome\Application\chrome.exe")
+        && !NativeEngine.SharedHost(playerPath),"Only shared host images are excluded from same-program matching")
+
+    for scenario in ["new browser window","existing browser window","previous foreground","other program","missing context","old serial"] {
+        fixture := CompatibilityFixture(false), fixture.Intent.Flags := NativeEngine.LinkLaunchFlag | 1
+        fixture.Intent.Id := "", fixture.Intent.Before := 31
+        fixture.LinkState := {Serial:7,Path:A_AhkPath,Excluded:Map(12,true)}
+        fixture.Selected := CompatibilityChecks.Window(11,101)
+        switch scenario {
+            case "existing browser window": fixture.Selected.Hwnd := 12
+            case "previous foreground": fixture.Selected.Hwnd := 31
+            case "other program": fixture.Selected.Data.Path := A_Temp . "\other.exe"
+            case "missing context": fixture.LinkState := 0
+            case "old serial": fixture.LinkState.Serial := 6
+        }
+        CompatibilityChecks.Assert(fixture.BeginCompatibility(7,2),"A link launch starts its bounded after-show backup")
+        CompatibilityChecks.Stable(fixture)
+        CompatibilityChecks.Assert(fixture.Requests.Length = (scenario = "new browser window"),"Link launch selection: " . scenario)
+    }
+    fixture := CompatibilityFixture(false), fixture.Intent.Flags := NativeEngine.LinkLaunchFlag | 1, fixture.Intent.NativeClaimed := 1
+    fixture.LinkState := {Serial:7,Path:A_AhkPath,Excluded:Map()}
+    fixture.BeginCompatibility(7,2)
+    CompatibilityChecks.NoRequest(fixture,"A link window claimed before first show is given time to finish natively")
+    fixture.Now += 500, fixture.CompatibilityTick()
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1,"An unfinished native link placement is completed by the after-show backup")
+    CompatibilityChecks.Assert(InStr(fixture.Owner.Messages[1],"链接窗口随屏"),"Link feedback names the link follow")
 
     fixture := CompatibilityFixture(), fixture.Intent.Flags := NativeEngine.JumpListFlag | 1
     fixture.Intent.Before := 21, fixture.Intent.Source := 20

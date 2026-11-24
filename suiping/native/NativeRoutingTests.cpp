@@ -72,7 +72,7 @@ void CheckAppInput(HMODULE module,HMONITOR monitor) {
     NativeIntent opened{};
     Check(intent(Messages.serial,&opened,sizeof(opened)) && opened.entry.flags==TF_APP_LAUNCH
         && opened.monitor==reinterpret_cast<UINT_PTR>(monitor) && opened.source==reinterpret_cast<UINT_PTR>(source.hwnd)
-        && opened.expires-opened.released==2000,"app intent freezes source, physical monitor, and expiry");
+        && opened.expires-opened.released==5000,"app intent freezes source, physical monitor, and five-second expiry");
     Check(opened.entry.count>=2 && opened.entry.windows[0].hwnd==opened.source
         && opened.entry.windows[0].pid==GetCurrentProcessId(),"app intent pins its click source PID");
     bool foundVisible=false,foundHidden=false;
@@ -345,6 +345,26 @@ int wmain(int argc,wchar_t** argv) {
             && snapshot.expires-snapshot.released==2000,"shell launch preserves origin HWND and its two-second expiry");
         cancel(0); Check(!intent(Messages.serial,&snapshot,sizeof(snapshot)),"another input cancels shell-origin routing");
         Check(!shellLaunch(nullptr,target),"a missing/unowned shell source cannot be armed in test mode");
+        auto armLaunch=reinterpret_cast<unsigned(*)(const wchar_t*,HMONITOR)>(GetProcAddress(module,"TF_ArmLaunch"));
+        Check(armLaunch!=nullptr,"link launch interface is available");
+        wchar_t ownPath[1024]{}; GetModuleFileNameW(nullptr,ownPath,1024);
+        NativeStatus beforeLinkState{};
+        Check(status(&beforeLinkState,sizeof(beforeLinkState))!=FALSE,"read status before a link launch");
+        const unsigned beforeLink=Messages.compat;
+        const unsigned linkSerial=armLaunch(ownPath,target);
+        Check(linkSerial!=0,"a link launch is armed on the input thread and returns its serial");
+        Wait([&] {return Messages.compat==beforeLink+1;});
+        Check(Messages.serial==linkSerial && Messages.monitor==target && intent(linkSerial,&snapshot,sizeof(snapshot)),
+            "link launch posts a readable after-show intent for its target");
+        Check(snapshot.entry.flags==(TF_COLD_START|TF_LINK_LAUNCH) && snapshot.entry.count==0
+            && CompareStringOrdinal(snapshot.entry.path,-1,ownPath,-1,TRUE)==CSTR_EQUAL && !snapshot.entry.appId[0],
+            "link launch carries only the exact executable path");
+        Check(snapshot.expires-snapshot.released==8000 && !snapshot.source,"link launch uses the configured activation timeout");
+        Check(status(&state,sizeof(state)) && state.armed==beforeLinkState.armed+1
+            && state.eventNumber==beforeLinkState.eventNumber,"link launch arms once and is not reported as a taskbar click");
+        cancel(0); Check(!intent(linkSerial,&snapshot,sizeof(snapshot)),"new input cancels a pending link launch");
+        Check(!armLaunch(nullptr,target) && !armLaunch(L"",target) && !armLaunch(ownPath,nullptr),"incomplete link requests are rejected");
+        enable(FALSE); Check(!armLaunch(ownPath,target),"a paused controller does not arm link launches"); enable(TRUE);
         entry.count=0; entry.flags=0;
         Check(!release(&entry,target,FALSE),"unverified no-window button remains unsupported");
         wcscpy_s(entry.path,L"C:\\not-the-test-executable.exe"); entry.flags=TF_COLD_START|TF_COMPATIBILITY;

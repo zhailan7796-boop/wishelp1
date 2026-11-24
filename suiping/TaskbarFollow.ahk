@@ -7,6 +7,7 @@
 #Include lib\StatusWindow.ahk
 #Include lib\NativeEngine.ahk
 #Include lib\DisplayStartup.ahk
+#Include lib\LinkFollow.ahk
 
 if A_LineFile = A_ScriptFullPath {
     Desktop.Physical()
@@ -142,6 +143,7 @@ class TaskbarFollow {
         if this.NativeMode
             A_TrayMenu.Add("悬停预览随屏",ObjBindMethod(this,"TogglePeek"))
         A_TrayMenu.Add("连接第二块屏幕时自动启动", ObjBindMethod(this, "ToggleStartup"))
+        A_TrayMenu.Add("应用里打开的链接也随屏…", ObjBindMethod(this, "ConfigureLinkFollow"))
         A_TrayMenu.Add()
         A_TrayMenu.Add("打开配置（修改后重启）", (*) => Run('notepad.exe "' . this.Config . '"'))
         A_TrayMenu.Add("打开日志", ObjBindMethod(this, "OpenLog"))
@@ -159,6 +161,7 @@ class TaskbarFollow {
             A_IconTip := "随屏 · 任务栏窗口跟随`n" . (!this.Enabled ? "已暂停" : (this.HelperReady && this.MappingsReady ? "运行中" : "正在连接任务栏识别器"))
             (this.Enabled ? A_TrayMenu.Check("启用任务栏跟随") : A_TrayMenu.Uncheck("启用任务栏跟随"))
             (DisplayStartup.IsEnabled(A_ScriptDir) ? A_TrayMenu.Check("连接第二块屏幕时自动启动") : A_TrayMenu.Uncheck("连接第二块屏幕时自动启动"))
+            (LinkFollow.Active(A_ScriptDir) ? A_TrayMenu.Check("应用里打开的链接也随屏…") : A_TrayMenu.Uncheck("应用里打开的链接也随屏…"))
             if this.NativeMode
                 (this.FollowPeek ? A_TrayMenu.Check("悬停预览随屏") : A_TrayMenu.Uncheck("悬停预览随屏"))
         }
@@ -317,6 +320,59 @@ class TaskbarFollow {
         this.ReportActivity(enabled ? "屏幕连接检测已开启，连接第二块屏幕时自动启动。" : "屏幕连接检测已关闭。")
         this.UpdateTray()
     }
+    ConfigureLinkFollow(*) {
+        if this.TestOnly
+            return
+        changed := false
+        try changed := LinkFollow.SetupDialog(this.Config,A_ScriptDir)
+        catch as failure {
+            this.Log("link follow setup failed: " . failure.Message)
+            MsgBox("无法更新链接随屏：`n" . failure.Message,LinkFollow.Title,"Iconx")
+        }
+        if changed
+            this.Log("link follow setup changed; registered=" . LinkFollow.RegisteredFor(A_ScriptDir) . "; default=" . LinkFollow.IsDefault())
+        this.UpdateTray()
+    }
+    ; WM_COPYDATA from LinkOpen.ahk (same portable runtime): the user opened a
+    ; link in another app; arm the browser's next new window for that screen.
+    LinkRequest(sender,cds) {
+        bytes := NumGet(cds,A_PtrSize,"uint"), ptr := NumGet(cds,A_PtrSize*2,"ptr")
+        if bytes < 2 || bytes > 16384 || Mod(bytes,2) || !ptr
+            return 0
+        text := StrGet(ptr,bytes//2-1) ; copy before the sender's buffer can go away
+        if !this.Enabled || !this.Started || this.TestOnly || !IsObject(this.Native)
+            return 0
+        try {
+            senderPath := this.Identity.Get(sender).Path
+            if senderPath = "" || StrLower(senderPath) != StrLower(A_AhkPath)
+                return 0
+            fields := StrSplit(text,"`n")
+            if fields.Length < 4 || fields[1] != "launch"
+                return 0
+            target := Desktop.Monitor(Integer(fields[2])), path := fields[3]
+            if !IsObject(target) || !LinkFollow.UsableBrowser(path)
+                return 0
+            excluded := Map()
+            for item in StrSplit(fields[4],",") {
+                if item != ""
+                    excluded[Integer(item)] := true
+            }
+            ; Keep the posted after-show message behind this context.
+            previousCritical := A_IsCritical
+            Critical("On")
+            try serial := this.Native.ArmLink(path,target.Handle,excluded)
+            finally Critical(previousCritical ? previousCritical : "Off")
+            SplitPath(path,&browserExe)
+            this.Log("link launch " . (serial ? "armed" : "not-armed") . "; serial=" . serial . "; target=" . target.Device
+                . "; browser=" . browserExe . "; existing-windows=" . excluded.Count)
+            if serial
+                this.ReportActivity("已接到应用里打开的链接，正在点击的屏幕打开浏览器新窗口。")
+            return serial ? 1 : 0
+        } catch as failure {
+            try this.Log("link launch request error: " . failure.Message . "; line=" . failure.Line)
+            return 0
+        }
+    }
     StartHelper() {
         if this.HelperHandle
             this.StopHelper()
@@ -358,6 +414,8 @@ class TaskbarFollow {
         }
     }
     HelperReply(sender, cds, *) {
+        if cds && NumGet(cds, "uptr") = LinkFollow.Magic
+            return this.LinkRequest(sender, cds)
         if sender != this.HelperHwnd || !this.HelperReady || !cds
             return 0
         magic := NumGet(cds, "uptr")

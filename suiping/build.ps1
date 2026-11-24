@@ -20,7 +20,9 @@ $dist = Join-Path $root 'dist'
 $staging = Join-Path $dist ('stage-' + [Guid]::NewGuid().ToString('N'))
 $packageRoot = Join-Path $staging 'TaskbarFollow'
 New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
-foreach ($name in @('TaskbarFollow.ahk','DisplayWatch.ahk','Probe.ahk','Diagnose.ahk','Start.exe','Start.cmd','settings.default.ini','README.md','LICENSE','THIRD-PARTY-NOTICES.md','build.ps1')) {
+# Undo script for the link handler; the name is built from code points so this file stays encoding-neutral.
+$undoLinkCmd = (-join [char[]](0x64A4,0x9500,0x94FE,0x63A5,0x968F,0x5C4F)) + '.cmd'
+foreach ($name in @('TaskbarFollow.ahk','DisplayWatch.ahk','Probe.ahk','Diagnose.ahk','LinkOpen.ahk','Start.exe','Start.cmd',$undoLinkCmd,'settings.default.ini','README.md','LICENSE','THIRD-PARTY-NOTICES.md','build.ps1')) {
     Copy-Item -LiteralPath (Join-Path $root $name) -Destination $packageRoot
 }
 Copy-Item -LiteralPath (Join-Path $root 'settings.default.ini') -Destination (Join-Path $packageRoot 'settings.ini')
@@ -34,6 +36,7 @@ New-Item -ItemType Directory -Path $runtime,$tests,$tools -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'tools\Invoke-InputDesktop.ps1') -Destination $tools
 Copy-Item -LiteralPath (Join-Path $root 'tools\Configure-DisplayStartup.ahk') -Destination $tools
 Copy-Item -LiteralPath (Join-Path $root 'tools\Inspect-NativeState.ps1') -Destination $tools
+Copy-Item -LiteralPath (Join-Path $root 'tools\Configure-LinkFollow.ahk') -Destination $tools
 $nativePackage = Join-Path $packageRoot 'native'
 $nativeBin = Join-Path $nativePackage 'bin'
 New-Item -ItemType Directory -Path $nativeBin -Force | Out-Null
@@ -47,7 +50,7 @@ Copy-Item -LiteralPath (Join-Path $root ('native\bin\' + $nativeDll)) -Destinati
 foreach ($name in @('AutoHotkey64.exe','AutoHotkey32.exe','license.txt')) {
     Copy-Item -LiteralPath (Join-Path $root ('runtime\' + $name)) -Destination $runtime
 }
-foreach ($name in @('Unit.ahk','IdentityCache.ahk','IdentityCacheSnapshot.ahk','IdentitySnapshot.ahk','AppIdentity.ahk','CompatibilityFollow.ahk','SelfFollow.ahk','NativeShutdown.ahk','NativeCacheStartup.ahk','DisplayAutoStart.ahk','BackgroundInstance.ahk','BackgroundInstanceFixture.ahk','Smoke.ahk','UiaCache.ahk','UiaCacheSnapshot.ahk','WindowMove.ahk','WindowMoveFixture.ahk','Instance.ahk','InstanceFixture.ahk','Run-Tests.ps1','LiveChrome.ahk','LiveTaskbar.ahk','LiveRequestedApps.ahk','TaskbarInput.ahk','HoverInput.ahk','StatusRefresh.ahk','Run-LiveTaskbar.ps1')) {
+foreach ($name in @('Unit.ahk','IdentityCache.ahk','IdentityCacheSnapshot.ahk','IdentitySnapshot.ahk','AppIdentity.ahk','CompatibilityFollow.ahk','LinkFollow.ahk','SelfFollow.ahk','NativeShutdown.ahk','NativeCacheStartup.ahk','DisplayAutoStart.ahk','BackgroundInstance.ahk','BackgroundInstanceFixture.ahk','Smoke.ahk','UiaCache.ahk','UiaCacheSnapshot.ahk','WindowMove.ahk','WindowMoveFixture.ahk','Instance.ahk','InstanceFixture.ahk','Run-Tests.ps1','LiveChrome.ahk','LiveTaskbar.ahk','LiveRequestedApps.ahk','TaskbarInput.ahk','HoverInput.ahk','StatusRefresh.ahk','Run-LiveTaskbar.ps1')) {
     Copy-Item -LiteralPath (Join-Path $root ('tests\' + $name)) -Destination $tests
 }
 $verify = Start-Process -FilePath (Join-Path $packageRoot 'Start.exe') -ArgumentList '--check' -WorkingDirectory $packageRoot -WindowStyle Hidden -Wait -PassThru

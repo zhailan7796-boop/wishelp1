@@ -2,7 +2,7 @@
 ; Every verified taskbar click also has a bounded, identity-checked backup.
 class NativeEngine {
     static PackagedFollowFlag := 8, VerifiedFollowFlag := 16, ShellLaunchFlag := 32, JumpListFlag := 64
-    static AppLaunchFlag := 128, AfterShowFlags := 4 | 8 | 16 | 32 | 64 | 128
+    static AppLaunchFlag := 128, LinkLaunchFlag := 256, AfterShowFlags := 4 | 8 | 16 | 32 | 64 | 128 | 256
     static ExistingWindowFollowFlags := 4 | 16
     static Exports() => ["Start", "StopAndWait", "Configure", "SetEnabled", "Cancel", "PublishCache", "Status",
         "SetPeekEnabled", "ShowPeek", "HidePeek", "HoverCandidates", "AccessibleName", "CompatibilityIntent", "CancelCompatibility", "IntentBytes", "BeginFallback", "NextInputStatus"]
@@ -32,6 +32,9 @@ class NativeEngine {
         this.StopError := 0, this.StartAttempted := false, this.StartError := 0
         this.Compatibility := 0, this.CompatibilityMoves := 0
         this.CompatibilityTimer := ObjBindMethod(this,"CompatibilityTick")
+        ; Optional export: an older DLL keeps every other feature; the link
+        ; handler then falls back to moving the new browser window itself.
+        this.ArmLaunchFn := 0, this.LinkState := 0
         this.Initialize(path != "" ? path : NativeEngine.DllPath())
     }
     Initialize(path) {
@@ -70,6 +73,22 @@ class NativeEngine {
         }
         if DllCall(this.IntentBytesFn,"uint") != 3152
             throw Error("原生定位组件版本不匹配。")
+        this.ArmLaunchFn := DllCall("kernel32\GetProcAddress", "ptr", this.Handle, "astr", "TF_ArmLaunch", "ptr")
+    }
+    SupportsLinkLaunch() => this.Handle && this.HasOwnProp("ArmLaunchFn") && this.ArmLaunchFn
+    ; The 随屏链接 handler is about to start the browser. Arm its next new
+    ; window for the clicked monitor; existing browser windows stay excluded.
+    ArmLink(path,monitorHandle,excluded) {
+        if !this.Owner.Enabled || !this.SupportsLinkLaunch()
+            return 0
+        serial := DllCall(this.ArmLaunchFn,"wstr",path,"ptr",monitorHandle,"uint")
+        ; Only one native transaction exists at a time; a new one supersedes it.
+        this.LinkState := serial ? {Serial:serial,Path:path,Excluded:excluded} : 0
+        return serial
+    }
+    LinkFor(serial) {
+        state := this.HasOwnProp("LinkState") ? this.LinkState : 0
+        return IsObject(state) && state.Serial = serial ? state : 0
     }
     SetEnabled(enabled) {
         if !enabled
@@ -163,15 +182,19 @@ class NativeEngine {
             packaged := !!(fresh.Flags & NativeEngine.PackagedFollowFlag)
             shell := !!(fresh.Flags & NativeEngine.ShellLaunchFlag), verified := !!(fresh.Flags & NativeEngine.VerifiedFollowFlag)
             jumpList := !!(fresh.Flags & NativeEngine.JumpListFlag), appLaunch := !!(fresh.Flags & NativeEngine.AppLaunchFlag)
-            label := appLaunch ? "应用内新窗口随屏" : (jumpList || shell ? "打开窗口随屏"
-                : (verified ? "窗口补充定位" : (packaged ? "应用包窗口补充定位" : "32位兼容定位")))
-            logLabel := appLaunch ? "app launch" : (jumpList ? "taskbar jump list" : (shell ? "shell launch"
-                : (verified ? "verified follow" : (packaged ? "packaged follow" : "32-bit compatibility"))))
+            link := !!(fresh.Flags & NativeEngine.LinkLaunchFlag)
+            label := link ? "链接窗口随屏" : (appLaunch ? "应用内新窗口随屏" : (jumpList || shell ? "打开窗口随屏"
+                : (verified ? "窗口补充定位" : (packaged ? "应用包窗口补充定位" : "32位兼容定位"))))
+            logLabel := link ? "link launch" : (appLaunch ? "app launch" : (jumpList ? "taskbar jump list" : (shell ? "shell launch"
+                : (verified ? "verified follow" : (packaged ? "packaged follow" : "32-bit compatibility")))))
             this.Compatibility := {Serial:serial,Id:fresh.Id,Source:fresh.Source,Observed:0,Target:target,Expires:fresh.Expires,Hwnd:0,Pid:0,Since:0,
-                Requested:false,RequestedAt:0,Recovering:false,MovePlan:0,Label:label,LogLabel:logLabel,AppLaunch:appLaunch ? fresh : 0}
+                Requested:false,RequestedAt:0,Recovering:false,MovePlan:0,Label:label,LogLabel:logLabel,AppLaunch:appLaunch ? fresh : 0,
+                Unmatched:0,UnmatchedAt:0}
             this.CompatibilitySchedule(true)
         } finally Critical(previousCritical ? previousCritical : "Off")
-        if !appLaunch
+        if link
+            this.Owner.ReportActivity("链接窗口随屏：正在等待浏览器在点击的屏幕打开新窗口。")
+        else if !appLaunch
             this.Owner.ReportActivity(label . "正在等待所选窗口显示。")
         return true
     }
@@ -198,8 +221,12 @@ class NativeEngine {
         if !hwnd
             return 0
         state := this.Compatibility
-        source := IsObject(state) && IsObject(state.AppLaunch) ? state.AppLaunch.Source : 0
-        return {Hwnd:hwnd,Data:this.Owner.Identity.Get(hwnd),Eligible:Desktop.Eligible(hwnd,source),Owner:Desktop.Owner(hwnd),
+        appLaunch := IsObject(state) && IsObject(state.AppLaunch)
+        source := appLaunch ? state.AppLaunch.Source : 0
+        ; In-app launches also accept tool-style windows of the clicked program
+        ; (e.g. 芒果TV's Qt player window); the identity checks stay unchanged.
+        refusal := appLaunch ? Desktop.LaunchedWindowRefusal(hwnd,source) : (Desktop.Eligible(hwnd,source) ? "" : "ineligible")
+        return {Hwnd:hwnd,Data:this.Owner.Identity.Get(hwnd),Eligible:refusal = "",Refusal:refusal,Owner:Desktop.Owner(hwnd),
             Visible:DllCall("user32\IsWindowVisible","ptr",hwnd),Minimized:Desktop.IsMin(hwnd),
             Monitor:Desktop.MonitorOf(hwnd)}
     }
@@ -236,7 +263,76 @@ class NativeEngine {
             return true
         if origin.AppId != "" && window.Data.AppId != ""
             return origin.AppId == window.Data.AppId
-        return sameProcess
+        if sameProcess
+            return true
+        return this.CompatibilityRelatedProcess(origin,window)
+    }
+    ; Multi-process applications (video players, meeting or document hosts) can
+    ; show the window a click asked for from another process. Accept the same
+    ; installed program image, or a process started by the clicked one. Shared
+    ; hosts and this controller never qualify on the image alone.
+    CompatibilityRelatedProcess(origin,window) {
+        pid := window.Data.Pid
+        if !pid || pid = DllCall("kernel32\GetCurrentProcessId","uint")
+            return false
+        if origin.Path != "" && window.Data.Path != "" && StrLower(origin.Path) = StrLower(window.Data.Path)
+            && !NativeEngine.SharedHost(origin.Path)
+            return true
+        return this.CompatibilityDescendant(pid,origin.Pid)
+    }
+    static SharedHost(path) {
+        static hosts := Map("applicationframehost.exe",1,"dllhost.exe",1,"rundll32.exe",1,"explorer.exe",1,
+            "java.exe",1,"javaw.exe",1,"python.exe",1,"pythonw.exe",1,"node.exe",1,"electron.exe",1,
+            "msedgewebview2.exe",1,"msedge.exe",1,"chrome.exe",1,"firefox.exe",1,"brave.exe",1,
+            "windowsterminal.exe",1,"openconsole.exe",1,"conhost.exe",1,"cmd.exe",1,"powershell.exe",1,"pwsh.exe",1,
+            "wscript.exe",1,"cscript.exe",1,"mshta.exe",1,"wwahost.exe",1)
+        SplitPath(path,&exe,&directory)
+        exe := StrLower(exe), directory := StrLower(directory), system := StrLower(A_WinDir)
+        if directory = system || InStr(directory,system . "\") = 1
+            return true
+        return hosts.Has(exe) || InStr(exe,"autohotkey") = 1
+    }
+    CompatibilityDescendant(pid,ancestor) {
+        if !pid || !ancestor || pid = ancestor
+            return false
+        child := this.CompatibilityProcessInfo(pid)
+        Loop 4 {
+            if !IsObject(child) || !child.Parent || child.Parent = pid
+                return false
+            parentPid := child.Parent
+            parent := this.CompatibilityProcessInfo(parentPid)
+            ; A recycled parent PID belongs to a process newer than its child.
+            if !IsObject(parent) || !parent.Created || !child.Created || parent.Created > child.Created
+                return false
+            if parentPid = ancestor
+                return true
+            pid := parentPid, child := parent
+        }
+        return false
+    }
+    CompatibilityProcessInfo(pid) => NativeEngine.ProcessInfo(pid)
+    static ProcessInfo(pid) {
+        process := DllCall("kernel32\OpenProcess","uint",0x1000,"int",false,"uint",pid,"ptr")
+        if !process
+            return 0
+        try {
+            basic := Buffer(48,0), times := Buffer(32,0)
+            ; PROCESS_BASIC_INFORMATION.InheritedFromUniqueProcessId is at 40 on x64.
+            if DllCall("ntdll\NtQueryInformationProcess","ptr",process,"int",0,"ptr",basic,"uint",basic.Size,"ptr",0,"int") != 0
+                return 0
+            if !DllCall("kernel32\GetProcessTimes","ptr",process,"ptr",times,"ptr",times.Ptr+8,"ptr",times.Ptr+16,"ptr",times.Ptr+24)
+                return 0
+            return {Parent:NumGet(basic,40,"uptr"),Created:NumGet(times,0,"int64")}
+        } finally DllCall("kernel32\CloseHandle","ptr",process)
+    }
+    ; Link requests come from the 随屏链接 handler, not from a click on this
+    ; desktop. Only a brand-new window of the exact browser image may follow.
+    CompatibilityLinkMatches(intent,window) {
+        if window.Hwnd = intent.Before || intent.Path = "" || window.Data.Path = ""
+            || StrLower(window.Data.Path) != StrLower(intent.Path)
+            return false
+        link := this.LinkFor(intent.Serial)
+        return IsObject(link) && !link.Excluded.Has(window.Hwnd)
     }
     CompatibilityRescue(intent) {
         ; With no usable in-process hook, Explorer may minimize an application
@@ -258,18 +354,22 @@ class NativeEngine {
         state := this.Compatibility
         if (Desktop.Foreground() != hwnd && !state.Recovering) || Desktop.Pid(hwnd) != state.Pid
             return "focus-changed"
-        state.MovePlan := WindowMoveOperation(hwnd,target,state.Recovering)
+        ; A window with no taskbar button of its own (e.g. 芒果TV's Qt player) is
+        ; moved directly: minimizing it first can make it vanish for good.
+        state.MovePlan := WindowMoveOperation(hwnd,target,state.Recovering,WindowMoveOperation.NoTaskbarButton(hwnd))
         return state.MovePlan.Start()
     }
     CompatibilityAdvanceMove(state) => state.MovePlan.Advance()
     static CompatibilityDelay(intent) => (intent.Flags & (NativeEngine.PackagedFollowFlag | NativeEngine.VerifiedFollowFlag
-        | NativeEngine.JumpListFlag)) && intent.NativeClaimed ? 500 : 80
+        | NativeEngine.JumpListFlag | NativeEngine.LinkLaunchFlag)) && intent.NativeClaimed ? 500 : 80
     CompatibilityMatches(intent,window,ownTransition := false) {
         if !IsObject(window) || !window.Hwnd || !window.Data.Pid || !window.Visible || !window.Eligible
             return false
         if window.Minimized && !ownTransition && !(window.HasOwnProp("Recovery") && window.Recovery
             && (intent.Flags & NativeEngine.ExistingWindowFollowFlags) && window.Hwnd = intent.Before)
             return false
+        if intent.Flags & NativeEngine.LinkLaunchFlag
+            return this.CompatibilityLinkMatches(intent,window)
         if intent.Flags & NativeEngine.AppLaunchFlag
             return this.CompatibilityAppMatches(intent,window)
         if intent.Flags & NativeEngine.ShellLaunchFlag
@@ -319,7 +419,38 @@ class NativeEngine {
         this.Compatibility := 0
         if IsObject(state) && IsObject(state.MovePlan)
             state.MovePlan.Cancel()
+        if IsObject(state) && state.HasOwnProp("Unmatched") && IsObject(state.Unmatched) && !state.Hwnd
+            try this.LogUnmatched(state) ; diagnostics must never break cancellation
         return true
+    }
+    ; Ordinary clicks stay silent. Only a new foreground window that appeared
+    ; during the wait but was not accepted is recorded once, for diagnosis.
+    LogUnmatched(state) {
+        window := state.Unmatched, state.Unmatched := 0
+        intent := state.AppLaunch
+        reason := !window.Visible ? "hidden" : (!window.Eligible ? "ineligible" : (window.Minimized ? "minimized" : "unrelated-process"))
+        sourcePid := IsObject(intent) && intent.Candidates.Length ? intent.Candidates[1].Pid : 0
+        origin := 0
+        try origin := this.CompatibilityAppOrigin(state.Source)
+        sourcePath := IsObject(origin) && origin.HasOwnProp("Path") ? origin.Path : ""
+        owner := window.HasOwnProp("Owner") ? window.Owner : 0
+        className := window.HasOwnProp("Class") ? window.Class : Desktop.Class(window.Hwnd)
+        refusal := window.HasOwnProp("Refusal") ? window.Refusal : ""
+        ; Window styles and size, so the next unmatched case can be diagnosed from the log alone.
+        style := DllCall("user32\GetWindowLongPtrW","ptr",window.Hwnd,"int",-16,"ptr")
+        exStyle := DllCall("user32\GetWindowLongPtrW","ptr",window.Hwnd,"int",-20,"ptr")
+        rect := Desktop.Rect(window.Hwnd)
+        size := IsObject(rect) ? rect.W . "x" . rect.H : "?"
+        monitor := window.HasOwnProp("Monitor") && IsObject(window.Monitor) ? window.Monitor.Device : ""
+        try this.Owner.Log("app launch unmatched-window; serial=" . state.Serial . "; reason=" . reason
+            . (refusal != "" && refusal != "ineligible" ? "; refusal=" . refusal : "")
+            . "; target=" . state.Target.Device . "; source-hwnd=" . state.Source . "; source-pid=" . sourcePid
+            . "; source-path=" . sourcePath . "; observed-hwnd=" . window.Hwnd . "; observed-pid=" . window.Data.Pid
+            . "; observed-path=" . window.Data.Path . "; observed-id=" . window.Data.AppId
+            . "; observed-class=" . className . "; observed-owner=" . owner . "; owner-pid=" . (owner ? Desktop.Pid(owner) : 0)
+            . "; style=" . Format("0x{:08X}",style & 0xFFFFFFFF) . "; exstyle=" . Format("0x{:08X}",exStyle & 0xFFFFFFFF)
+            . "; size=" . size . "; observed-monitor=" . monitor
+            . "; since-release-ms=" . (IsObject(intent) ? state.UnmatchedAt - intent.Released : 0))
     }
     EndCompatibility(state,text := "",success := false,outcome := "ended") {
         previousCritical := A_IsCritical
@@ -428,13 +559,19 @@ class NativeEngine {
             }
             window := this.CompatibilityForeground()
             state.Observed := window
-            if !this.CompatibilityMatches(intent,window) {
+            matched := this.CompatibilityMatches(intent,window)
+            if !matched && IsObject(state.AppLaunch) && IsObject(window) && !state.Requested
+                && NativeEngine.NewAppWindow(state.AppLaunch,window.Hwnd,window.Data.Pid)
+                && (!IsObject(state.Unmatched) || state.Unmatched.Hwnd != window.Hwnd)
+                state.Unmatched := window, state.UnmatchedAt := now
+            if !matched {
                 if state.Requested && state.Recovering
                     window := this.CompatibilitySnapshot(state.Hwnd)
                 else if !state.Requested
                     window := this.CompatibilityRescue(intent)
+                matched := this.CompatibilityMatches(intent,window)
             }
-            if !this.CompatibilityMatches(intent,window) {
+            if !matched {
                 if state.Requested
                     this.EndCompatibility(state,state.Label . "已结束，所选窗口已隐藏、最小化或切换焦点。",false,"window-no-longer-matches")
                 else

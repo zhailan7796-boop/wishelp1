@@ -9,9 +9,11 @@ Refresh(hwnd,target) {
         return result
     return Finish(operation)
 }
-Finish(operation) {
+Finish(operation,neverMinimized := false) {
     deadline := Desktop.Tick()+1000
     while Desktop.Tick()<deadline {
+        if neverMinimized && Desktop.IsMin(operation.Hwnd)
+            return "minimized-during-direct-move"
         result := operation.Advance()
         if result = "complete"
             return "requested"
@@ -178,6 +180,23 @@ try {
     if WindowMover.Move(g.Hwnd, changed) != "monitor-changed"
         throw Error("A stale work-area snapshot was accepted")
     Log("PASS normal/maximized/minimized/no-op/stale-monitor native cases")
+    ; Direct mode, used for windows without a taskbar button (芒果TV's player):
+    ; the window moves without ever being minimized, normal and maximized.
+    if !WindowMoveOperation.NoTaskbarButton(g.Hwnd)
+        throw Error("A tool window was not recognized as having no taskbar button")
+    DllCall("user32\ShowWindow","ptr",g.Hwnd,"int",4)
+    Sleep(100)
+    operation := WindowMoveOperation(g.Hwnd,two,false,true)
+    if operation.Start() != "requested" || Finish(operation,true) != "requested"
+        || Desktop.IsMin(g.Hwnd) || !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd),two) || NumGet(Desktop.Placement(g.Hwnd),8,"uint") = 3
+        throw Error("Direct normal move failed")
+    DllCall("user32\ShowWindow","ptr",g.Hwnd,"int",3)
+    Sleep(150)
+    operation := WindowMoveOperation(g.Hwnd,one,false,true)
+    if operation.Start() != "requested" || Finish(operation,true) != "requested"
+        || Desktop.IsMin(g.Hwnd) || !Desktop.SameMonitor(Desktop.MonitorOf(g.Hwnd),one) || NumGet(Desktop.Placement(g.Hwnd),8,"uint") != 3
+        throw Error("Direct maximized move failed")
+    Log("PASS direct (never minimized) normal/maximized moves")
     g.Destroy()
     ForeignCases(A_AhkPath,one,two)
     ForeignCases(A_ScriptDir . "\..\runtime\AutoHotkey32.exe",one,two)

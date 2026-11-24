@@ -8,6 +8,11 @@ diagnostics.txt
 !/tools/Invoke-InputDesktop.ps1
 !/tools/Configure-DisplayStartup.ahk
 !/tools/Inspect-NativeState.ps1
+!/tools/Configure-LinkFollow.ahk
+!/tools/Update-Native.ps1
+!/tools/Activate-Fixes.ps1
+!/tools/Restart-Engine.ahk
+/backup/
 dist/
 tests/results/
 tests/logs/
