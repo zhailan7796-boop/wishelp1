@@ -55,12 +55,29 @@ class Desktop {
         b := Buffer(16, 0)
         return DllCall("user32\GetWindowRect", "ptr", hwnd, "ptr", b) ? ScreenRect.FromBuffer(b) : 0
     }
-    static MonitorAt(x, y) => this.Monitor(DllCall("user32\MonitorFromPoint", "int64", this.Point(x, y), "uint", 2, "ptr"))
+    ; Restores a context returned by Physical() (0 = nothing to restore).
+    static RestoreDpi(previous) => previous && DllCall("user32\SetThreadDpiAwarenessContext", "ptr", previous, "ptr")
+    static MonitorAt(x, y) {
+        previous := this.Physical()
+        try handle := DllCall("user32\MonitorFromPoint", "int64", this.Point(x, y), "uint", 2, "ptr")
+        finally this.RestoreDpi(previous)
+        return this.Monitor(handle)
+    }
     static MonitorOf(hwnd) => this.Monitor(DllCall("user32\MonitorFromWindow", "ptr", hwnd, "uint", 2, "ptr"))
+    ; Monitor geometry is always read in physical pixels, whatever context the
+    ; caller runs in. A message another process sends to this script (the
+    ; 随屏链接 WM_COPYDATA) runs in the script window's system-DPI context; with
+    ; mixed scaling, the same screen read there had different numbers, which
+    ; the follow-up check took for a display change and cancelled the link.
     static Monitor(handle) {
         b := Buffer(104, 0)
         NumPut("uint", 104, b)
-        if !handle || !DllCall("user32\GetMonitorInfoW", "ptr", handle, "ptr", b)
+        if !handle
+            return 0
+        previous := this.Physical()
+        try ok := DllCall("user32\GetMonitorInfoW", "ptr", handle, "ptr", b)
+        finally this.RestoreDpi(previous)
+        if !ok
             return 0
         return {Handle: handle, Bounds: ScreenRect.FromBuffer(b, 4), Work: ScreenRect.FromBuffer(b, 20),
             Device: StrGet(b.Ptr + 40, 32)}
@@ -779,9 +796,16 @@ class WindowMoveOperation {
             this.Normal.Write(placement,28)
         NumPut("uint",7,placement,8) ; SW_SHOWMINNOACTIVE
         this.Phase := this.WasMin ? "placing" : "minimizing"
-        return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",placement)
-            ? "requested" : "minimize-placement-failed:" A_LastError
+        result := this.SetPlacement("minimize","requested")
+        ; Moving a normal window does not require changing its show state.
+        if result = "minimize-placement-failed:5" && !this.WasMin && !this.WasMax
+            && Desktop.Pid(this.Hwnd) = this.Pid && DllCall("user32\IsWindowVisible","ptr",this.Hwnd)
+            && !Desktop.IsMin(this.Hwnd) && !DllCall("user32\IsZoomed","ptr",this.Hwnd)
+            return this.StartDirect(mapped)
+        return result
     }
+    SetPlacement(stage,success) => DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
+        ? success : stage . "-placement-failed:" A_LastError
     ; Visible window, no minimize. Normal: one asynchronous SetWindowPos to the
     ; mapped screen rectangle (no activation or z-order change; NOCOPYBITS so the
     ; window repaints on the new screen). Maximized: restore onto the target in
@@ -793,8 +817,7 @@ class WindowMoveOperation {
             NumPut("int",-1,"int",-1,this.Placement,20) ; let Windows place the maximized window on the target
             NumPut("uint",4,this.Placement,8) ; SW_SHOWNOACTIVATE: restore, no minimize
             this.Phase := "unmaximizing"
-            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
-                ? "requested" : "direct-placement-failed:" A_LastError
+            return this.SetPlacement("direct","requested")
         }
         this.Phase := "restoring" ; Advance's final check confirms the arrival
         ; SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS
@@ -818,24 +841,21 @@ class WindowMoveOperation {
                 return "waiting"
             NumPut("uint",3,this.Placement,8) ; SW_SHOWMAXIMIZED, now on the target screen
             this.Phase := "restoring"
-            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
-                ? "waiting" : "maximize-placement-failed:" A_LastError
+            return this.SetPlacement("maximize","waiting")
         }
         if this.Phase = "minimizing" {
             if !minimized
                 return "waiting"
             this.Normal.Write(this.Placement,28)
             this.Phase := "placing"
-            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
-                ? "waiting" : "target-placement-failed:" A_LastError
+            return this.SetPlacement("target","waiting")
         }
         if this.Phase = "placing" {
             if !minimized || !Desktop.SameMonitor(Desktop.MonitorOf(this.Hwnd),this.Target)
                 return "waiting"
             NumPut("uint",this.WasMax ? 3 : 9,this.Placement,8)
             this.Phase := "restoring"
-            return DllCall("user32\SetWindowPlacement","ptr",this.Hwnd,"ptr",this.Placement)
-                ? "waiting" : "restore-placement-failed:" A_LastError
+            return this.SetPlacement("restore","waiting")
         }
         if minimized || !Desktop.SameMonitor(Desktop.MonitorOf(this.Hwnd),this.Target)
             return "waiting"

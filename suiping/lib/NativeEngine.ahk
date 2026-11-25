@@ -479,6 +479,8 @@ class NativeEngine {
             }
         } finally Critical(previousCritical ? previousCritical : "Off")
         this.LogCompatibilityOutcome(state,success ? "confirmed" : outcome)
+        if !success && RegExMatch(outcome,"-(?:placement|move)-failed:5$")
+            text := "Windows 拒绝移动此窗口。如果窗口以管理员身份打开，请用普通权限的入口重试。"
         if text != ""
             this.Owner.ReportActivity(text)
     }

@@ -61,9 +61,11 @@ HHOOK CbtHook{}, CallHook{}, MouseHook{}, KeyboardHook{};
 constexpr UINT PeekCommand=WM_APP+71;
 constexpr UINT LaunchCommand=WM_APP+72;
 constexpr UINT OwnWindowCommand=0x8054, CompatibilityCommand=0x8055;
-// Shell/desktop clicks keep their short window. Applications often fetch data
-// or start a helper process before showing the window a click asked for.
-constexpr unsigned ShellLaunchMs=2000, AppLaunchMs=5000;
+// Applications often fetch data or start a helper process before showing the
+// window a click asked for. Desktop/Explorer shortcuts start the same programs
+// (e.g. the 32-bit MangoTV player shows its window after 1-2.5 s), so both wait 5 s; any new
+// click or key press still cancels the wait at once.
+constexpr unsigned ShellLaunchMs=5000, AppLaunchMs=5000;
 PeekPreview PeekUi;
 volatile LONG PeekEnabled=1, PeekGeneration=0;
 struct PeekRequest { HWND source,popup; DWORD pid; POINT point; LONG generation; };

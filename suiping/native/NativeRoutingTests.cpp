@@ -342,7 +342,7 @@ int wmain(int argc,wchar_t** argv) {
         Check(intent(Messages.serial,&snapshot,sizeof(snapshot)) && snapshot.entry.flags==TF_SHELL_LAUNCH
             && snapshot.entry.count==0 && !snapshot.entry.path[0] && !snapshot.entry.appId[0],"shell origin does not invent a target application identity");
         Check(snapshot.before==reinterpret_cast<UINT_PTR>(statusWindow) && snapshot.source==snapshot.before
-            && snapshot.expires-snapshot.released==2000,"shell launch preserves origin HWND and its two-second expiry");
+            && snapshot.expires-snapshot.released==5000,"shell launch preserves origin HWND and its five-second expiry");
         cancel(0); Check(!intent(Messages.serial,&snapshot,sizeof(snapshot)),"another input cancels shell-origin routing");
         Check(!shellLaunch(nullptr,target),"a missing/unowned shell source cannot be armed in test mode");
         auto armLaunch=reinterpret_cast<unsigned(*)(const wchar_t*,HMONITOR)>(GetProcAddress(module,"TF_ArmLaunch"));

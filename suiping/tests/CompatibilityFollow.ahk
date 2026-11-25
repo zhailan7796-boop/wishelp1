@@ -466,6 +466,13 @@ try {
     fixture.Valid := false, fixture.CompatibilityTick()
     CompatibilityChecks.Assert(!fixture.Scheduled,"Any new input cancels the shell-launch backup")
 
+    fixture := CompatibilityFixture(false), fixture.Intent.Flags := NativeEngine.ShellLaunchFlag
+    fixture.MoveResult := "direct-move-failed:5"
+    fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+    CompatibilityChecks.Assert(fixture.Requests.Length = 1 && !fixture.Scheduled && !fixture.CompatibilityMoves
+        && InStr(fixture.Owner.Messages[-1],"Windows 拒绝移动") && InStr(fixture.Owner.Logs[-1],"direct-move-failed:5"),
+        "A shell window that Windows refuses to move reports access denied and stops")
+
     playerPath := "D:\Apps\Fixture\Player.exe"
     for scenario in ["new same PID","new exact AppID","new owned dialog","new same program image","new child process",
         "clicked source","old foreground","visible sibling","visible other PID","unrelated PID","same PID different AppID",

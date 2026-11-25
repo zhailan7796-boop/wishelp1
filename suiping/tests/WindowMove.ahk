@@ -33,6 +33,13 @@ WaitFor(observation,label) {
     }
     throw Error(label)
 }
+class DeniedPlacementMove extends WindowMoveOperation {
+    Attempts := 0
+    SetPlacement(stage,success) {
+        this.Attempts += 1
+        return stage . "-placement-failed:5"
+    }
+}
 ForeignCases(executable,one,two) {
     unique := "TaskbarFollow foreign move " . DllCall("kernel32\GetCurrentProcessId","uint") . "-" . A_TickCount
     hwnd := 0, focus := Desktop.Foreground(), anchor := 0
@@ -43,10 +50,18 @@ ForeignCases(executable,one,two) {
         hwnd := WinExist(unique . " ahk_pid " . child)
         if WindowMover.Move(hwnd,one,true) != "already-there"
             WaitFor(() => Desktop.SameMonitor(Desktop.MonitorOf(hwnd),one),"Foreign fixture setup did not move")
-        if Refresh(hwnd,two) != "requested" || Desktop.IsMin(hwnd)
+        operation := DeniedPlacementMove(hwnd,two)
+        if operation.Start() != "requested" || Finish(operation,true) != "requested"
+            || operation.Attempts != 1 || !Desktop.SameMonitor(Desktop.MonitorOf(hwnd),two)
+            throw Error("A denied minimize did not fall back to a direct move")
+        if Refresh(hwnd,one) != "requested" || Refresh(hwnd,two) != "requested" || Desktop.IsMin(hwnd)
             throw Error("Foreign normal refresh failed")
         DllCall("user32\ShowWindowAsync","ptr",hwnd,"int",3)
         WaitFor(() => NumGet(Desktop.Placement(hwnd),8,"uint")=3,"Foreign fixture did not maximize")
+        operation := DeniedPlacementMove(hwnd,one)
+        if operation.Start() != "minimize-placement-failed:5" || operation.Attempts != 1
+            || !Desktop.SameMonitor(Desktop.MonitorOf(hwnd),two) || NumGet(Desktop.Placement(hwnd),8,"uint") != 3
+            throw Error("Access denied must preserve a maximized window's state and position")
         if Refresh(hwnd,one) != "requested" || NumGet(Desktop.Placement(hwnd),8,"uint") != 3
             throw Error("Foreign maximized refresh failed")
         DllCall("user32\ShowWindowAsync","ptr",hwnd,"int",7)
@@ -78,7 +93,7 @@ ForeignCases(executable,one,two) {
         Sleep(150)
         if !Desktop.IsMin(hwnd) || operation.Advance() != "cancelled"
             throw Error("Cancelling an originally minimized window restored it")
-        Log("PASS foreign async movement and cancellation; runtime=" . executable)
+        Log("PASS foreign async movement, access-denied fallback and cancellation; runtime=" . executable)
     } finally {
         if IsObject(anchor)
             anchor.Destroy()
