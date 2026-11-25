@@ -11,7 +11,7 @@ Windows 11 多屏小工具：在哪块屏幕上点开，窗口就出现在哪块
 
 ## 下载与使用
 
-**下载：** [v0.3.8 便携 ZIP](https://github.com/zhailan7796-boop/wishelp1/releases/download/suiping-v0.3.8/TaskbarFollow-0.3.8-portable.zip) · [更新说明](https://github.com/zhailan7796-boop/wishelp1/releases/tag/suiping-v0.3.8)
+**下载：** [v0.3.9 便携 ZIP](https://github.com/zhailan7796-boop/wishelp1/releases/download/suiping-v0.3.9/TaskbarFollow-0.3.9-portable.zip) · [更新说明](https://github.com/zhailan7796-boop/wishelp1/releases/tag/suiping-v0.3.9)
 
 1. 下载便携版 ZIP，解压整个文件夹。
 2. 双击 **Start.exe**，状态窗口显示「运行中」就可以用了。不用安装，也不需要管理员权限。
