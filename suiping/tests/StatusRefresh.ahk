@@ -81,6 +81,9 @@ try {
     panel.SetRefreshActive(true)
     Sleep(1200)
     RefreshChecks.Assert(panel.Footer.Text != previous,"Visible runtime continues ticking once per second")
+    packaged := IniRead(FollowStatusWindow.AppDirectory . "\native\bin\runtime.ini","Native","Version","")
+    RefreshChecks.Assert(packaged != "" && InStr(panel.Footer.Text,"v" . packaged . " ") && FollowStatusWindow.Version == packaged,
+        "The footer shows the packaged version from runtime.ini, not a hardcoded one")
     panel.Window.Minimize()
     Sleep(40)
     RefreshChecks.Assert(Desktop.IsMin(panel.Window.Hwnd),"Owned status fixture minimizes")

@@ -392,14 +392,24 @@ class NativeEngine {
             return false
         bothPaths := intent.Path != "" && window.Data.Path != ""
         samePath := bothPaths && StrLower(intent.Path) = StrLower(window.Data.Path)
-        if bothPaths && !samePath
+        ; With no live window, the cold path is the shortcut target. That can be
+        ; a small launcher which hands over to the real program image in its own
+        ; folder (飞书: Feishu\Feishu.exe -> Feishu\app\Feishu.exe), and which
+        ; re-shows an already running window from there. Accept only that
+        ; same-named image below the launcher's folder, judged as the launcher.
+        launcherImage := bothPaths && !samePath && !intent.Candidates.Length
+            && NativeEngine.LauncherImage(intent.Path,window.Data.Path)
+        if bothPaths && !samePath && !launcherImage
             return false
+        verifiedPath := samePath || launcherImage
+        identity := launcherImage ? {Pid:window.Data.Pid,AppId:window.Data.AppId,Path:intent.Path,Exe:window.Data.Exe}
+            : window.Data
         if jumpList {
             ; Menu commands can open a new instance of a verified application.
             return window.Data.AppId != "" ? this.Owner.Identity.Match(intent.Id,window.Data)
-                : samePath && (intent.Flags & 1) && !(intent.Flags & 2)
+                : verifiedPath && (intent.Flags & 1) && !(intent.Flags & 2)
         }
-        if !intent.Candidates.Length && (!samePath || !(intent.Flags & 1)
+        if !intent.Candidates.Length && (!verifiedPath || !(intent.Flags & 1)
             || ((intent.Flags & 2) && !(window.Data.AppId == intent.Id)))
             return false
         ; A fresh exact AppID can establish a new foreground HWND even if the
@@ -407,8 +417,21 @@ class NativeEngine {
         ; requires the HWND/PID captured for this button.
         if window.Data.AppId != ""
             return this.Owner.Identity.Match(intent.Id,window.Data)
-        return (listed || !intent.Candidates.Length) && samePath && !(intent.Flags & 2)
-            && this.Owner.Identity.Match(intent.Id,window.Data)
+        return (listed || !intent.Candidates.Length) && verifiedPath && !(intent.Flags & 2)
+            && this.Owner.Identity.Match(intent.Id,identity)
+    }
+    ; True only for `image` = <launcher folder>\...\<launcher file name>, i.e. the
+    ; same program name in a subfolder of a real program folder. Drive roots,
+    ; the Windows folder and shared hosts (browsers, script hosts) never qualify.
+    static LauncherImage(launch,image) {
+        if launch = "" || image = "" || InStr(launch,"\.") || InStr(image,"\.")
+            return false
+        SplitPath(launch,&launchName,&launchDir), SplitPath(image,&imageName,&imageDir)
+        if launchName = "" || StrLower(launchName) != StrLower(imageName) || StrLower(launchDir) = StrLower(imageDir)
+            return false
+        if !RegExMatch(launchDir,"i)^[a-z]:\\[^\\]+") || NativeEngine.SharedHost(launch) || NativeEngine.SharedHost(image)
+            return false
+        return InStr(StrLower(imageDir) . "\",StrLower(launchDir) . "\") = 1
     }
     CompatibilityCurrent(state) => IsObject(this.Compatibility) && this.Compatibility = state && this.Handle && this.Owner.Enabled
     StopCompatibility(expected := 0) {
@@ -492,6 +515,7 @@ class NativeEngine {
             observation := "; observed-hwnd=" . observed.Hwnd . "; observed-pid=" . observed.Data.Pid
                 . "; observed-id=" . observed.Data.AppId . "; observed-eligible=" . observed.Eligible
                 . "; observed-visible=" . observed.Visible . "; observed-minimized=" . observed.Minimized
+                . "; observed-path=" . (observed.Data.HasOwnProp("Path") ? observed.Data.Path : "")
         else
             observation := "; observed-hwnd=0"
         try this.Owner.Log(state.LogLabel . " " . outcome . "; serial=" . state.Serial . "; id=" . state.Id

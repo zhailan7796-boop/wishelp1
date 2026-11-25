@@ -193,6 +193,42 @@ try {
     fixture := CompatibilityFixture(false), fixture.Selected.Data.AppId := "Fixture.Other"
     fixture.BeginCompatibility(7,2)
     CompatibilityChecks.NoRequest(fixture,"An explicit foreign AppID cannot borrow the matching path")
+
+    ; 飞书 2026-11-25 13:56: its pinned shortcut targets a launcher
+    ; (...\Feishu\Feishu.exe); the window it re-shows belongs to ...\Feishu\app\Feishu.exe.
+    launcher := "C:\Users\Fixture\AppData\Local\Feishu\Feishu.exe"
+    for scenario in ["real image below launcher","shortcut-only mapping","versioned image below launcher",
+        "sibling installation","other name below launcher","drive-root launcher","warm snapshot path",
+        "required AppID missing","explicit foreign AppID","shared host below launcher","parent-relative path"] {
+        fixture := CompatibilityFixture(false), fixture.Intent.Flags := 17, fixture.Intent.Path := launcher
+        fixture.Owner.Identity.Mappings["Fixture.App"] := "Feishu.exe"
+        fixture.Selected.Data.Path := "C:\Users\Fixture\AppData\Local\Feishu\app\Feishu.exe", fixture.Selected.Data.Exe := "Feishu.exe"
+        switch scenario {
+            case "shortcut-only mapping": fixture.Owner.Identity.Mappings["Fixture.App"] := launcher
+            case "versioned image below launcher":
+                fixture.Selected.Data.Path := "C:\Users\Fixture\AppData\Local\Feishu\app-7.30.9\bin\Feishu.exe"
+            case "sibling installation": fixture.Selected.Data.Path := "C:\Users\Fixture\AppData\Local\FeishuBeta\app\Feishu.exe"
+            case "other name below launcher":
+                fixture.Selected.Data.Path := "C:\Users\Fixture\AppData\Local\Feishu\app\Helper.exe", fixture.Selected.Data.Exe := "Helper.exe"
+            case "drive-root launcher":
+                fixture.Intent.Path := "C:\Feishu.exe", fixture.Owner.Identity.Mappings["Fixture.App"] := "Feishu.exe"
+            case "warm snapshot path": fixture.Intent.Candidates := [{Hwnd:11,Pid:101}]
+            case "required AppID missing": fixture.Intent.Flags := 19
+            case "explicit foreign AppID": fixture.Selected.Data.AppId := "Fixture.Other"
+            case "shared host below launcher":
+                fixture.Intent.Path := "C:\Apps\Host\node.exe", fixture.Owner.Identity.Mappings["Fixture.App"] := "node.exe"
+                fixture.Selected.Data.Path := "C:\Apps\Host\app\node.exe", fixture.Selected.Data.Exe := "node.exe"
+            case "parent-relative path": fixture.Selected.Data.Path := "C:\Users\Fixture\AppData\Local\Feishu\..\Other\Feishu.exe"
+        }
+        fixture.BeginCompatibility(7,2), CompatibilityChecks.Stable(fixture)
+        expected := scenario = "real image below launcher" || scenario = "shortcut-only mapping"
+            || scenario = "versioned image below launcher"
+        CompatibilityChecks.Assert(fixture.Requests.Length = (expected ? 1 : 0),"Cold launcher shortcut: " . scenario)
+    }
+    CompatibilityChecks.Assert(NativeEngine.LauncherImage("D:\Apps\Fixture\Player.exe","d:\apps\fixture\APP\player.EXE")
+        && !NativeEngine.LauncherImage("D:\Apps\Fixture\Player.exe","D:\Apps\Fixture\Player.exe")
+        && !NativeEngine.LauncherImage("D:\Apps\Fixture\Player.exe","D:\Apps\FixtureX\Player.exe"),
+        "Launcher relation is case-insensitive, strictly below the launcher folder and never the same file")
     fixture := CompatibilityFixture(false), fixture.Intent.Flags := 7
     fixture.BeginCompatibility(7,2)
     CompatibilityChecks.NoRequest(fixture,"A shared host requiring an AppID rejects a missing remote AppID")
