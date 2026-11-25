@@ -22,9 +22,14 @@ $packageRoot = Join-Path $staging 'TaskbarFollow'
 New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 # Undo script for the link handler; the name is built from code points so this file stays encoding-neutral.
 $undoLinkCmd = (-join [char[]](0x64A4,0x9500,0x94FE,0x63A5,0x968F,0x5C4F)) + '.cmd'
-foreach ($name in @('TaskbarFollow.ahk','DisplayWatch.ahk','Probe.ahk','Diagnose.ahk','LinkOpen.ahk','Start.exe','Start.cmd',$undoLinkCmd,'settings.default.ini','README.md','LICENSE','THIRD-PARTY-NOTICES.md','build.ps1')) {
+foreach ($name in @('TaskbarFollow.ahk','DisplayWatch.ahk','Probe.ahk','Diagnose.ahk','LinkOpen.ahk','Start.exe','Start.cmd',$undoLinkCmd,'settings.default.ini','LICENSE','THIRD-PARTY-NOTICES.md','build.ps1')) {
     Copy-Item -LiteralPath (Join-Path $root $name) -Destination $packageRoot
 }
+# Users get the short description. In the maintainer's folder README.md holds development
+# notes and README-public.md the description; a source checkout has only README.md.
+$userReadme = Join-Path $root 'README-public.md'
+if (-not (Test-Path -LiteralPath $userReadme)) { $userReadme = Join-Path $root 'README.md' }
+Copy-Item -LiteralPath $userReadme -Destination (Join-Path $packageRoot 'README.md')
 Copy-Item -LiteralPath (Join-Path $root 'settings.default.ini') -Destination (Join-Path $packageRoot 'settings.ini')
 foreach ($dir in @('lib','docs','launcher','third-party')) {
     Copy-Item -LiteralPath (Join-Path $root $dir) -Destination $packageRoot -Recurse
